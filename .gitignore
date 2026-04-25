@@ -1,0 +1,9 @@
+hr_data/
+backups/
+__pycache__/
+*.pyc
+*.db
+*.db-wal
+*.db-shm
+.env
+*.log
