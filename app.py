@@ -105,6 +105,16 @@ h1,h2,h3,h4 { font-family: 'Cairo', sans-serif !important; }
 [data-testid="stSidebarHeader"] button,
 button[kind="header"],
 button[kind="headerNoPadding"] {display:none !important;}
+/* ── Sidebar nav spacing ── */
+[data-testid="stSidebar"] .stRadio > div > label {
+    padding: 6px 10px !important;
+    margin-bottom: 4px !important;
+    display: block;
+    border-radius: 8px;
+}
+[data-testid="stSidebar"] .stRadio > div {
+    gap: 4px !important;
+}
 /* ── Role badge ── */
 .badge-admin{background:#1B2A47;color:#C49A2A;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700;}
 .badge-hr   {background:#27ae60;color:white;padding:2px 10px;border-radius:12px;font-size:11px;font-weight:700;}
