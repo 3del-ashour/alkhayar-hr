@@ -550,15 +550,14 @@ if page == "📊 لوحة المعلومات":
     cards_html = ""
     for icon, label, val, sub, color in _cards:
         cards_html += f"""
-        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px 16px;
-                    border-top:4px solid {color};box-shadow:0 2px 6px rgba(0,0,0,0.05);">
-            <div style="font-size:22px;margin-bottom:4px;">{icon}</div>
-            <div style="font-size:12px;color:#8a97a8;font-weight:600;">{label}</div>
-            <div style="font-size:24px;font-weight:900;color:{color};line-height:1.2;margin-top:4px;">{val}</div>
-            <div style="font-size:11px;color:#aaa;">{sub}</div>
+        <div style="background:#fff;border:1px solid #eef1f5;border-radius:12px;padding:18px 16px;
+                    border-right:3px solid {color};">
+            <div style="font-size:12px;color:#8a97a8;font-weight:600;">{icon} {label}</div>
+            <div style="font-size:26px;font-weight:800;color:#1B2A47;line-height:1.2;margin-top:6px;">{val}</div>
+            <div style="font-size:11px;color:#b0b8c4;margin-top:2px;">{sub}</div>
         </div>"""
     st.markdown(f"""
-    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;direction:rtl;
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;direction:rtl;
                 font-family:'Cairo',sans-serif;margin-bottom:20px;">{cards_html}</div>
     """, unsafe_allow_html=True)
 
@@ -573,15 +572,14 @@ if page == "📊 لوحة المعلومات":
             bars += f"""
             <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;">
                 <div style="font-size:11px;font-weight:700;color:#1B2A47;white-space:nowrap;">{h['total_net']:,.0f}</div>
-                <div style="width:60%;height:{pct*1.4}px;background:linear-gradient(180deg,#2c3e6b,#1B2A47);
-                            border-radius:8px 8px 0 0;min-height:6px;"></div>
+                <div style="width:55%;height:{pct*1.2}px;background:#1B2A47;border-radius:6px 6px 0 0;min-height:6px;"></div>
                 <div style="font-size:11px;color:#8a97a8;font-weight:600;">{h['pay_period']}</div>
             </div>"""
         st.markdown(f"""
-        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px 22px;
+        <div style="background:#fff;border:1px solid #eef1f5;border-radius:12px;padding:20px 22px;
                     font-family:'Cairo',sans-serif;direction:rtl;margin-bottom:8px;">
-            <div style="font-size:15px;font-weight:800;color:#1B2A47;margin-bottom:16px;">📈 اتجاه تكلفة الرواتب — آخر {len(trend)} أشهر</div>
-            <div style="display:flex;align-items:flex-end;gap:14px;height:180px;">{bars}</div>
+            <div style="font-size:14px;font-weight:700;color:#1B2A47;margin-bottom:18px;">📈 اتجاه تكلفة الرواتب — آخر {len(trend)} أشهر</div>
+            <div style="display:flex;align-items:flex-end;gap:14px;height:170px;">{bars}</div>
         </div>
         """, unsafe_allow_html=True)
 
