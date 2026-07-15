@@ -522,12 +522,68 @@ if page == "📊 لوحة المعلومات":
     pp = f"{yr:04d}-{mo:02d}"
     run = db.get_payroll_run(pp)
 
-    c1,c2,c3,c4 = st.columns(4)
-    c1.metric("الموظفون النشطون", kpis["active_employees"])
-    c2.metric("إجمالي مسير الرواتب", f"{kpis['total_payroll']:,.0f} د.ل")
-    c3.metric("السلف القائمة", f"{kpis['outstanding_advances']:,.0f} د.ل")
-    c4.metric(f"مسير {MONTH_AR[mo]}",
-              "✅ مُقفل" if run and run.get("status")=="finalized" else "⏳ مفتوح")
+    # ── Greeting banner ──
+    _who = st.session_state.get("display_name") or st.session_state.get("username","")
+    _mo_status = "✅ مُقفل" if run and run.get("status")=="finalized" else "⏳ مفتوح"
+    st.markdown(f"""
+    <div style="background:linear-gradient(135deg,#1B2A47 0%,#2c3e6b 100%);border-radius:16px;
+                padding:20px 26px;display:flex;align-items:center;justify-content:space-between;
+                font-family:'Cairo',sans-serif;direction:rtl;margin-bottom:18px;">
+        <div>
+            <div style="color:white;font-size:20px;font-weight:900;">أهلاً، {_who} 👋</div>
+            <div style="color:#8AB0CC;font-size:13px;margin-top:2px;">{today.strftime('%A، %d %B %Y')}</div>
+        </div>
+        <div style="text-align:left;">
+            <div style="color:#8AB0CC;font-size:12px;font-weight:600;">مسير {MONTH_AR[mo]} {yr}</div>
+            <div style="color:#C49A2A;font-size:18px;font-weight:900;">{_mo_status}</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── KPI cards ──
+    _cards = [
+        ("👥", "الموظفون النشطون", f"{kpis['active_employees']}", "", "#1B2A47"),
+        ("💰", "إجمالي الرواتب", f"{kpis['total_payroll']:,.0f}", "د.ل / شهرياً", "#27ae60"),
+        ("💵", "السلف القائمة", f"{kpis['outstanding_advances']:,.0f}", f"{kpis.get('n_active_advances',0)} سلفة", "#e67e22"),
+        ("📅", "آخر صافي مسير", f"{kpis.get('last_payroll_net',0):,.0f}", kpis.get('last_payroll_month','—') or '—', "#8e44ad"),
+    ]
+    cards_html = ""
+    for icon, label, val, sub, color in _cards:
+        cards_html += f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:18px 16px;
+                    border-top:4px solid {color};box-shadow:0 2px 6px rgba(0,0,0,0.05);">
+            <div style="font-size:22px;margin-bottom:4px;">{icon}</div>
+            <div style="font-size:12px;color:#8a97a8;font-weight:600;">{label}</div>
+            <div style="font-size:24px;font-weight:900;color:{color};line-height:1.2;margin-top:4px;">{val}</div>
+            <div style="font-size:11px;color:#aaa;">{sub}</div>
+        </div>"""
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:14px;direction:rtl;
+                font-family:'Cairo',sans-serif;margin-bottom:20px;">{cards_html}</div>
+    """, unsafe_allow_html=True)
+
+    # ── 6-month payroll cost trend ──
+    hist_all = db.get_payroll_history()
+    trend = [h for h in hist_all if h.get("status")=="finalized"][:6][::-1]  # oldest→newest
+    if trend:
+        max_net = max((h["total_net"] for h in trend), default=1) or 1
+        bars = ""
+        for h in trend:
+            pct = max(4, round(h["total_net"]/max_net*100))
+            bars += f"""
+            <div style="flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;gap:6px;">
+                <div style="font-size:11px;font-weight:700;color:#1B2A47;white-space:nowrap;">{h['total_net']:,.0f}</div>
+                <div style="width:60%;height:{pct*1.4}px;background:linear-gradient(180deg,#2c3e6b,#1B2A47);
+                            border-radius:8px 8px 0 0;min-height:6px;"></div>
+                <div style="font-size:11px;color:#8a97a8;font-weight:600;">{h['pay_period']}</div>
+            </div>"""
+        st.markdown(f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:14px;padding:20px 22px;
+                    font-family:'Cairo',sans-serif;direction:rtl;margin-bottom:8px;">
+            <div style="font-size:15px;font-weight:800;color:#1B2A47;margin-bottom:16px;">📈 اتجاه تكلفة الرواتب — آخر {len(trend)} أشهر</div>
+            <div style="display:flex;align-items:flex-end;gap:14px;height:180px;">{bars}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     st.markdown("---")
     cl, cr = st.columns(2)
