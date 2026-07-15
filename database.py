@@ -2721,8 +2721,13 @@ def get_audit_log(limit: int = 200) -> list:
     rows = report_audit_log(limit)
     result = []
     for r in rows:
+        # Actor: prefer the explicit username, else fall back to the display_name
+        # resolved from user_id (covers salary/advance/payroll actions that only
+        # stored user_id). Guarantees every logged action shows WHO did it.
+        actor = r.get("username") or r.get("display_name") or "—"
         result.append({
             **r,
+            "username":  actor,
             "ts":        r.get("created_at", ""),
             "entity":    r.get("module", ""),
             "entity_id": "",
