@@ -885,7 +885,9 @@ def payroll_compute_line(emp_id:int,year:int,month:int)->dict:
 
     base   = salary_get_base(emp_id)
     wdays  = _working_days(year,month)
-    daily  = round(base/wdays,4) if wdays>0 else 0.0
+    # Absence deduction basis: the month is always treated as 30 days,
+    # so one absent day = base / 30 (e.g. 1500 / 30 = 50 per day).
+    daily  = round(base/30.0, 4)
     counts = attendance_absences_count(emp_id,year,month)
     absent_days = counts["absent"]+counts["half_day"]*0.5+counts["sick_leave"]
     absence_ded = round(daily*absent_days,2)
