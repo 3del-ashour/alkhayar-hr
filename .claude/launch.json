@@ -1,0 +1,12 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "AlKhayar HR & Payroll (Streamlit)",
+      "runtimeExecutable": "/Library/Frameworks/Python.framework/Versions/3.12/bin/streamlit",
+      "runtimeArgs": ["run", "app.py"],
+      "port": 8501,
+      "autoPort": false
+    }
+  ]
+}

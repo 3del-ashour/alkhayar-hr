@@ -98,6 +98,10 @@ h1,h2,h3,h4 { font-family: 'Cairo', sans-serif !important; }
     direction:rtl;text-align:right;font-family:'Cairo',sans-serif !important;}
 /* ── Hide branding ── */
 #MainMenu,footer,header{visibility:hidden;}
+/* ── Hide "Press Enter to submit form" hint (overlaps with RTL Arabic) ── */
+[data-testid="InputInstructions"],
+[data-testid="stTextInputInstructions"],
+[data-testid="stNumberInputInstructions"] {display:none !important;}
 /* ── Hide sidebar collapse button ── */
 [data-testid="collapsedControl"],
 [data-testid="stSidebarCollapseButton"],
@@ -150,6 +154,59 @@ def require(action: str):
                     unsafe_allow_html=True)
         st.stop()
 
+# ── Toast + Undo stack ─────────────────────────────────────────────
+UNDO_REGISTRY = {
+    "advance":         ("سلفة",          lambda i: __import__('database').get_db().__enter__().execute("DELETE FROM advance_instalments WHERE advance_id=?; DELETE FROM advances WHERE id=?", (i,i))),
+    "installment":     ("قسط راتب",       lambda i: __import__('database').salary_installment_delete(i)),
+    "bonus":           ("مكافأة",         None),
+    "penalty":         ("عقوبة",         lambda i: __import__('database').penalty_delete(i)),
+    "expense":         ("مصروف شركة",     lambda i: __import__('database').expense_delete(i)),
+    "custody_expense": ("مصروف عهدة",     lambda i: __import__('database').branch_custody_expense_delete(i)),
+    "charge":          ("مستحق",         lambda i: __import__('database').charge_delete(i)),
+    "acc_payment":     ("دفعة حساب",      lambda i: __import__('database').payment_delete(i)),
+}
+
+def track_action(msg: str, undo_type: str = None, undo_id: int = None):
+    """Show toast + push to undo stack (kept per session, last 5)."""
+    st.toast(f"✅ {msg}", icon="✅")
+    if undo_type and undo_id and undo_type in UNDO_REGISTRY:
+        stack = st.session_state.setdefault("_undo_stack", [])
+        stack.append({
+            "type": undo_type, "id": int(undo_id), "msg": msg,
+            "at": today.strftime("%d/%m %H:%M"),
+        })
+        st.session_state["_undo_stack"] = stack[-5:]
+
+def do_undo(entry: dict):
+    """Perform the undo based on registry."""
+    import database as _db
+    t, i = entry["type"], entry["id"]
+    try:
+        if t == "advance":
+            with _db.get_db() as c:
+                c.execute("DELETE FROM advance_instalments WHERE advance_id=?", (i,))
+                c.execute("DELETE FROM advances WHERE id=?", (i,))
+            return True, "تم إلغاء السلفة"
+        if t == "installment":
+            return _db.salary_installment_delete(i)
+        if t == "bonus":
+            with _db.get_db() as c:
+                c.execute("DELETE FROM employee_allowances WHERE id=?", (i,))
+            return True, "تم إلغاء المكافأة"
+        if t == "penalty":
+            return _db.penalty_delete(i)
+        if t == "expense":
+            return _db.expense_delete(i)
+        if t == "custody_expense":
+            return _db.branch_custody_expense_delete(i)
+        if t == "charge":
+            return _db.charge_delete(i)
+        if t == "acc_payment":
+            return _db.payment_delete(i)
+    except Exception as e:
+        return False, str(e)
+    return False, "نوع غير معروف"
+
 def logo_b64() -> str:
     if LOGO_PATH.exists():
         return base64.b64encode(LOGO_PATH.read_bytes()).decode()
@@ -180,6 +237,35 @@ def show_login():
             u = st.text_input("اسم المستخدم", placeholder="username")
             p = st.text_input("كلمة المرور", type="password", placeholder="••••••••")
             sub = st.form_submit_button("تسجيل الدخول ←", type="primary", use_container_width=True)
+
+        # ── Enter on username → focus password field ──
+        st.components.v1.html("""
+        <script>
+        (function attachEnterFlow(){
+            const doc = window.parent.document;
+            function wire(){
+                const userInp = doc.querySelector('input[type="text"]:not([data-enter-wired])');
+                const passInp = doc.querySelector('input[type="password"]');
+                if (userInp && passInp){
+                    userInp.setAttribute('data-enter-wired','1');
+                    userInp.addEventListener('keydown', function(e){
+                        if (e.key === 'Enter' || e.keyCode === 13){
+                            e.preventDefault();
+                            e.stopPropagation();
+                            passInp.focus();
+                        }
+                    }, true);
+                    return true;
+                }
+                return false;
+            }
+            let tries = 0;
+            const iv = setInterval(function(){
+                if (wire() || ++tries > 20) clearInterval(iv);
+            }, 200);
+        })();
+        </script>
+        """, height=0)
 
         if sub:
             if not u or not p:
@@ -228,13 +314,32 @@ with st.sidebar:
     st.markdown("---")
 
     pages = ["📊 لوحة المعلومات","👥 الموظفون","💰 هيكل الرواتب",
-             "📅 الحضور والغياب","💵 السلف","🎁 المكافآت",
+             "📅 الحضور والغياب","💵 السلف والقروض","💸 أقساط من الراتب","🎁 المكافآت",
              "⚖️ العقوبات",
-             "🧾 مسير الرواتب","📄 كشوف الرواتب","📈 التقارير"]
+             "💰 صرف الراتب الشهري","🧾 مسير الرواتب","📄 كشوف الرواتب","📈 التقارير"]
     if can("all"):
-        pages += ["📒 مصروفات الشركة","👑 إدارة المستخدمين","💼 السحوبات الشخصية","🔒 الأمان"]
+        pages += ["🧾 الحسابات","📦 عهدة الفروع","📒 مصروفات الشركة","👑 إدارة المستخدمين","💼 السحوبات الشخصية","🔒 الأمان"]
 
     page = st.radio("", pages, label_visibility="hidden")
+
+    # ── Undo panel (admin only) ──
+    stack = st.session_state.get("_undo_stack", [])
+    if can("all") and stack:
+        st.markdown("---")
+        with st.expander(f"🔙 تراجع ({len(stack)})"):
+            for i, act in enumerate(reversed(stack)):
+                label_ar = UNDO_REGISTRY.get(act["type"], (act["type"],))[0]
+                c1, c2 = st.columns([4,1])
+                c1.markdown(f'<div style="font-size:12px;color:#1B2A47;font-weight:600;">{label_ar}</div><div style="font-size:11px;color:#8a97a8;">{act["at"]} — {act["msg"][:40]}</div>', unsafe_allow_html=True)
+                if c2.button("↩️", key=f"undo_{i}_{act['type']}_{act['id']}", help="تراجع عن هذا الإجراء"):
+                    ok, msg = do_undo(act)
+                    if ok:
+                        st.session_state["_undo_stack"].remove(act)
+                        st.toast(f"↩️ {msg}", icon="↩️")
+                        st.rerun()
+                    else:
+                        st.toast(f"⚠️ {msg}", icon="⚠️")
+
     st.markdown("---")
     st.markdown(f'<div style="font-size:11px;color:#8a97a8;">{today.strftime("%d/%m/%Y")} | v4.0</div>',
                 unsafe_allow_html=True)
@@ -565,12 +670,22 @@ elif page == "👥 الموظفون":
 
         emp_filter = st.radio("عرض:", ["✅ النشطون", "🔴 غير النشطون", "📋 الجميع"],
                               horizontal=True, label_visibility="collapsed")
+        # Branch filter
+        emp_branch_filter = st.selectbox("تصفية بالفرع",
+            ["all"] + list(db.BRANCH_NAMES.keys()),
+            format_func=lambda x: "🏢 كل الفروع" if x == "all" else db.BRANCH_NAMES[x],
+            key="emp_branch_filter")
+
         if emp_filter == "✅ النشطون":
             emps = db.get_employees(status="active")
         elif emp_filter == "🔴 غير النشطون":
             emps = [e for e in db.get_employees(status="all") if e["status"] != "active"]
         else:
             emps = db.get_employees(status="all")
+
+        # Apply branch filter
+        if emp_branch_filter != "all":
+            emps = [e for e in emps if str(e.get("branch_id","")) == emp_branch_filter]
         if emps:
             rows_html = ""
             for e in emps:
@@ -785,6 +900,13 @@ elif page == "💰 هيكل الرواتب":
             cur_struct = db.get_current_salary(sel)
             cur_items  = cur_struct.get("items",[]) if cur_struct else []
 
+            # ── Row counter OUTSIDE the form so + / − reflects immediately ──
+            st.markdown("---")
+            st.markdown("**البدلات الثابتة** (اختياري)")
+            st.caption("أضف بدلات ثابتة شهرية مثل: بدل سكن، بدل نقل، بدل اتصالات")
+            num_items = st.number_input("عدد البنود الإضافية", 0, 10,
+                                        value=len(cur_items), step=1, key=f"nitems_{sel}")
+
             with st.form("set_sal"):
                 c1,c2 = st.columns(2)
                 with c1:
@@ -796,15 +918,10 @@ elif page == "💰 هيكل الرواتب":
                     reason   = st.text_input("السبب *", placeholder="زيادة سنوية، ترقية...")
                     approved = st.text_input("معتمد من", value="الإدارة العليا")
 
-                st.markdown("---")
-                st.markdown("**البدلات الثابتة** (اختياري)")
-                st.caption("أضف بدلات ثابتة شهرية مثل: بدل سكن، بدل نقل، بدل اتصالات")
-                num_items = st.number_input("عدد البنود الإضافية", 0, 10,
-                                            value=len(cur_items), step=1)
                 items_data = []
                 for i in range(int(num_items)):
                     existing = cur_items[i] if i < len(cur_items) else {}
-                    ci1,ci2,ci3,ci4 = st.columns([3,2,2,1])
+                    ci1,ci2,ci3 = st.columns([3,2,2])
                     itype = ci1.selectbox(f"نوع {i+1}", ["allowance","deduction"],
                                           index=0 if existing.get("item_type","allowance")=="allowance" else 1,
                                           format_func=lambda x:"✅ بدل" if x=="allowance" else "🔴 خصم ثابت",
@@ -812,9 +929,8 @@ elif page == "💰 هيكل الرواتب":
                     iname = ci2.text_input(f"الاسم {i+1}", value=existing.get("item_name",""), key=f"in_{i}")
                     iamt  = ci3.number_input(f"المبلغ {i+1}", 0.0, step=10.0,
                                              value=float(existing.get("amount",0)), key=f"ia_{i}")
-                    ipct  = ci4.checkbox("%", value=bool(existing.get("is_percentage",0)), key=f"ip_{i}")
                     if iname.strip():
-                        items_data.append({"type":itype,"name":iname.strip(),"amount":iamt,"is_percentage":1 if ipct else 0})
+                        items_data.append({"type":itype,"name":iname.strip(),"amount":iamt,"is_percentage":0})
 
                 save_sal = st.form_submit_button("💾 حفظ هيكل الراتب", type="primary")
 
@@ -998,7 +1114,7 @@ elif page == "📅 الحضور والغياب":
 # ══════════════════════════════════════════════════════════════════
 # السلف
 # ══════════════════════════════════════════════════════════════════
-elif page == "💵 السلف":
+elif page == "💵 السلف والقروض":
     require("view_advances")
     st.markdown('<div class="sh">💵 السلف والقروض</div>', unsafe_allow_html=True)
     st.markdown("")
@@ -1022,8 +1138,10 @@ elif page == "💵 السلف":
                     reason=st.text_input("السبب")
                 sv_adv=st.form_submit_button("✅ تسجيل السلفة",type="primary")
             if sv_adv:
-                ok,msg,_ = db.add_advance(esp,amt,adv_date.isoformat(),reason,approved,int(n_inst),st.session_state["username"])
-                if ok: st.success(f"✅ {msg}"); st.rerun()
+                ok,msg,new_id = db.add_advance(esp,amt,adv_date.isoformat(),reason,approved,int(n_inst),st.session_state["username"])
+                if ok:
+                    track_action(f"سلفة {amt:,.0f} د.ل — {int(n_inst)} أقساط", "advance", new_id)
+                    st.success(f"✅ {msg}"); st.rerun()
                 else: st.error(f"⚠️ {msg}")
 
     with tab_act:
@@ -1092,6 +1210,193 @@ elif page == "💵 السلف":
         else: st.info("لا توجد سجلات.")
 
 # ══════════════════════════════════════════════════════════════════
+# دفعات الراتب (Salary Installments — partial salary during the month)
+# ══════════════════════════════════════════════════════════════════
+elif page == "💸 أقساط من الراتب":
+    require("view_employees")
+    st.markdown('<div class="sh">💸 أقساط من الراتب</div>', unsafe_allow_html=True)
+    st.markdown('<div class="inf">💡 لصرف قسط من راتب الموظف قبل نهاية الشهر. يُخصم تلقائياً من صافي الراتب عند صرف الراتب الشهري.<br>ليست سلفة أو قرض — هي أقساط من راتبه هو. لا يُسمح بصرف أقساط أكثر من الراتب الأساسي.</div>', unsafe_allow_html=True)
+    st.markdown("")
+
+    tab_new_si, tab_list_si, tab_bal_si = st.tabs(["➕ قسط جديد", "📋 سجل الشهر", "📊 الرصيد المتبقي"])
+
+    with tab_new_si:
+        if not can("add_employee"):
+            st.markdown('<div class="err">ليس لديك صلاحية.</div>', unsafe_allow_html=True)
+        else:
+            emps_si = db.get_employees(status="active")
+            # Employee + date OUTSIDE form so balance updates live
+            c1, c2 = st.columns(2)
+            si_emp = c1.selectbox("الموظف *", [e["id"] for e in emps_si],
+                format_func=lambda x: next((f"{e['employee_number']} — {e['full_name']}" for e in emps_si if e["id"]==x), ""),
+                key="si_emp_new")
+            si_date = c2.date_input("تاريخ الصرف", value=today, key="si_date_new")
+            mk_new = si_date.strftime("%Y-%m")
+
+            # Live balance card
+            base_new = 0.0
+            paid_new = 0.0
+            with db.get_db() as _c:
+                r = _c.execute("SELECT base_salary FROM salary_structures WHERE employee_id=? ORDER BY effective_date DESC LIMIT 1",(si_emp,)).fetchone()
+                if r: base_new = r["base_salary"]
+                r2 = _c.execute("SELECT COALESCE(SUM(amount),0) as t FROM salary_installments WHERE employee_id=? AND month_key=? AND settled=0",(si_emp, mk_new)).fetchone()
+                if r2: paid_new = r2["t"]
+            available = max(0.0, base_new - paid_new)
+
+            st.markdown(f"""
+            <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;font-family:'Cairo',sans-serif;direction:rtl;margin:12px 0;">
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #1B2A47;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">💰 الراتب الأساسي</div>
+                    <div style="font-size:20px;font-weight:900;color:#1B2A47;">{base_new:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #c0392b;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">💸 مسحوب هذا الشهر</div>
+                    <div style="font-size:20px;font-weight:900;color:#c0392b;">{paid_new:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #27ae60;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">✅ المتاح للسحب</div>
+                    <div style="font-size:20px;font-weight:900;color:#27ae60;">{available:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            if available <= 0:
+                st.markdown(f'<div class="warn">⚠️ الموظف سحب كامل راتبه لهذا الشهر ({paid_new:,.0f} د.ل من {base_new:,.0f} د.ل). أي قسط إضافي سيُرحّل للشهر التالي.</div>', unsafe_allow_html=True)
+
+            with st.form("si_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    si_amt = st.number_input("المبلغ (د.ل) *", min_value=1.0, step=50.0)
+                with c2:
+                    si_approved = st.text_input("معتمد من", value="الإدارة")
+                si_desc = st.text_input("ملاحظات", placeholder="سبب / تفاصيل القسط...")
+                sv_si = st.form_submit_button("💸 صرف قسط", type="primary")
+            if sv_si:
+                ok, msg = db.salary_installment_add(si_emp, si_amt, si_date.isoformat(),
+                    si_desc.strip(), si_approved.strip(), st.session_state["username"])
+                if ok:
+                    with db.get_db() as _c:
+                        _row = _c.execute("SELECT id FROM salary_installments WHERE employee_id=? ORDER BY id DESC LIMIT 1", (si_emp,)).fetchone()
+                        _lid = _row["id"] if _row else None
+                    track_action(f"قسط {si_amt:,.0f} د.ل", "installment", _lid)
+                    if "⚠️" in msg:
+                        st.warning(msg)
+                    else:
+                        st.success(f"✅ {msg}")
+                    st.rerun()
+                else:
+                    st.error(f"⚠️ {msg}")
+
+    with tab_list_si:
+        c1, c2, c3 = st.columns(3)
+        si_yr = c1.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="si_yr")
+        si_mo = c2.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="si_mo")
+        si_emps = db.get_employees(status="all")
+        si_emp_filter = c3.selectbox("الموظف", [0]+[e["id"] for e in si_emps],
+            format_func=lambda x: "الكل" if x==0 else next((f"{e['full_name']}" for e in si_emps if e["id"]==x), ""), key="si_emp_f")
+        mk_si = f"{si_yr:04d}-{si_mo:02d}"
+        insts = db.salary_installment_list(
+            emp_id=si_emp_filter if si_emp_filter else None,
+            month_key=mk_si,
+            include_settled=True)
+        if insts:
+            rows_html = ""
+            total_si = 0
+            for p in insts:
+                total_si += p["amount"]
+                settled_badge = '<span style="background:#27ae60;color:white;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700;">✅ مُسوَّاة</span>' if p.get("settled") else '<span style="background:#f39c12;color:white;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700;">⏳ معلَّقة</span>'
+                rows_html += f"""<tr>
+                    <td style="font-weight:700;color:#1B2A47;">{p['full_name']}</td>
+                    <td style="font-weight:600;color:#c0392b;">{p['amount']:,.0f} د.ل</td>
+                    <td style="color:#555;">{p['pay_date']}</td>
+                    <td style="color:#555;">{p.get('description','') or '—'}</td>
+                    <td style="color:#555;font-size:12px;">{p.get('approved_by','') or '—'}</td>
+                    <td style="text-align:center;">{settled_badge}</td>
+                </tr>"""
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;margin-top:8px;">
+                <thead><tr style="background:#1B2A47;color:white;">
+                    <th style="padding:10px 14px;text-align:right;">الموظف</th>
+                    <th style="padding:10px 14px;text-align:right;">المبلغ</th>
+                    <th style="padding:10px 14px;text-align:right;">التاريخ</th>
+                    <th style="padding:10px 14px;text-align:right;">ملاحظات</th>
+                    <th style="padding:10px 14px;text-align:right;">معتمد من</th>
+                    <th style="padding:10px 14px;text-align:center;">الحالة</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+            <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+            table tbody tr:hover{{background:#edf2f7;}}
+            table tbody td{{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+            """, unsafe_allow_html=True)
+            st.markdown("")
+            st.metric(f"إجمالي دفعات {MONTH_AR[si_mo]} {si_yr}", f"{total_si:,.0f} د.ل")
+
+            # Delete unsettled
+            if can("all"):
+                unsettled = [p for p in insts if not p.get("settled")]
+                if unsettled:
+                    st.markdown("---")
+                    st.markdown("#### 🗑️ حذف دفعة معلَّقة")
+                    c1, c2 = st.columns([3,1])
+                    to_del = c1.selectbox("اختر",
+                        [p["id"] for p in unsettled],
+                        format_func=lambda x: next((f"{p['full_name']} — {p['amount']:,.0f} د.ل — {p['pay_date']}" for p in unsettled if p["id"]==x),""))
+                    if c2.button("🗑️ حذف", type="primary"):
+                        ok, msg = db.salary_installment_delete(to_del)
+                        if ok:
+                            st.success(f"✅ {msg}"); st.rerun()
+                        else:
+                            st.error(f"⚠️ {msg}")
+        else:
+            st.info(f"لا توجد دفعات في {MONTH_AR[si_mo]} {si_yr}.")
+
+    with tab_bal_si:
+        c1, c2 = st.columns(2)
+        bal_yr = c1.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="bal_yr")
+        bal_mo = c2.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="bal_mo")
+        summary = db.salary_installment_summary(bal_yr, bal_mo)
+        if summary:
+            rows_html = ""
+            total_paid = 0
+            total_rem = 0
+            for s in summary:
+                total_paid += s["paid"]
+                total_rem  += s["remaining"]
+                pct = round(s["paid"] / s["base_salary"] * 100, 1) if s["base_salary"] > 0 else 0
+                bar_color = "#c0392b" if pct >= 90 else "#f39c12" if pct >= 50 else "#27ae60"
+                rows_html += f"""<tr>
+                    <td style="font-weight:700;color:#1B2A47;">{s['full_name']}</td>
+                    <td style="text-align:right;font-weight:600;color:#1B2A47;">{s['base_salary']:,.0f} د.ل</td>
+                    <td style="text-align:center;color:#555;">{s['tx_count']}</td>
+                    <td style="text-align:right;font-weight:700;color:#c0392b;">{s['paid']:,.0f} د.ل</td>
+                    <td style="text-align:right;font-weight:700;color:#27ae60;">{s['remaining']:,.0f} د.ل</td>
+                    <td style="text-align:center;"><span style="background:{bar_color};color:white;padding:3px 12px;border-radius:10px;font-size:12px;font-weight:700;">{pct}%</span></td>
+                </tr>"""
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;margin-top:8px;">
+                <thead><tr style="background:#1B2A47;color:white;">
+                    <th style="padding:10px 14px;text-align:right;">الموظف</th>
+                    <th style="padding:10px 14px;text-align:right;">الراتب الأساسي</th>
+                    <th style="padding:10px 14px;text-align:center;">عدد الدفعات</th>
+                    <th style="padding:10px 14px;text-align:right;">المسحوب</th>
+                    <th style="padding:10px 14px;text-align:right;">المتبقي</th>
+                    <th style="padding:10px 14px;text-align:center;">نسبة المسحوب</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+            <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+            table tbody tr:hover{{background:#edf2f7;}}
+            table tbody td{{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+            """, unsafe_allow_html=True)
+            st.markdown("")
+            c1, c2 = st.columns(2)
+            c1.metric("إجمالي المسحوب", f"{total_paid:,.0f} د.ل")
+            c2.metric("إجمالي المتبقي", f"{total_rem:,.0f} د.ل")
+        else:
+            st.info(f"لا توجد دفعات لـ {MONTH_AR[bal_mo]} {bal_yr}.")
+
+# ══════════════════════════════════════════════════════════════════
 # المكافآت (Bonuses only — deductions go through العقوبات)
 # ══════════════════════════════════════════════════════════════════
 elif page == "🎁 المكافآت":
@@ -1117,6 +1422,10 @@ elif page == "🎁 المكافآت":
             if not adj_desc.strip(): st.error("الوصف مطلوب")
             else:
                 db.add_adjustment(adj_emp,pp,"bonus",adj_desc.strip(),adj_amt,st.session_state["username"])
+                with db.get_db() as _c:
+                    _row = _c.execute("SELECT id FROM employee_allowances WHERE employee_id=? ORDER BY id DESC LIMIT 1", (adj_emp,)).fetchone()
+                    _lid = _row["id"] if _row else None
+                track_action(f"مكافأة {adj_amt:,.0f} د.ل — {adj_desc.strip()[:30]}", "bonus", _lid)
                 st.success("✅ تم تسجيل المكافأة"); st.rerun()
 
     with tab_view:
@@ -1191,6 +1500,10 @@ elif page == "⚖️ العقوبات":
                     ok, msg = db.penalty_add(pen_emp, pen_type, pen_amt, pen_date.isoformat(),
                         pen_reason.strip(), mk, st.session_state["username"])
                     if ok:
+                        with db.get_db() as _c:
+                            _row = _c.execute("SELECT id FROM penalties WHERE employee_id=? ORDER BY id DESC LIMIT 1", (pen_emp,)).fetchone()
+                            _lid = _row["id"] if _row else None
+                        track_action(f"عقوبة {pen_amt:,.0f} د.ل — {pen_reason.strip()[:30]}", "penalty", _lid)
                         st.success(f"✅ {msg}")
                         st.rerun()
                     else:
@@ -1241,6 +1554,128 @@ elif page == "⚖️ العقوبات":
 
 # ══════════════════════════════════════════════════════════════════
 # ══════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════
+# صرف الراتب الشهري — راتب فردي لموظف واحد
+# ══════════════════════════════════════════════════════════════════
+elif page == "💰 صرف الراتب الشهري":
+    require("view_payroll")
+    st.markdown('<div class="sh">💰 صرف الراتب الشهري — موظف واحد</div>', unsafe_allow_html=True)
+    st.markdown('<div class="inf">💡 لصرف راتب موظف واحد في أي وقت خلال الشهر. للمسير الشهري الكامل استخدم <b>🧾 مسير الرواتب</b>.</div>', unsafe_allow_html=True)
+    st.markdown("")
+
+    if not can("add_employee"):
+        st.markdown('<div class="err">ليس لديك صلاحية لصرف الرواتب.</div>', unsafe_allow_html=True)
+    else:
+        emps_sal = db.get_employees(status="active")
+        c1, c2, c3 = st.columns(3)
+        sal_emp = c1.selectbox("الموظف *", [e["id"] for e in emps_sal],
+            format_func=lambda x: next((f"{e['employee_number']} — {e['full_name']}" for e in emps_sal if e["id"]==x), ""),
+            key="sal_emp")
+        sal_yr = c2.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="sal_yr")
+        sal_mo = c3.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="sal_mo")
+        mk_sal = f"{sal_yr:04d}-{sal_mo:02d}"
+
+        # Check if already issued
+        already_issued = None
+        with db.get_db() as _conn:
+            row = _conn.execute("""
+                SELECT pl.payslip_number, pl.net_pay, pp.status
+                FROM payroll_lines pl JOIN payroll_periods pp ON pl.period_id=pp.id
+                WHERE pp.month_key=? AND pl.employee_id=?
+            """, (mk_sal, sal_emp)).fetchone()
+            if row:
+                already_issued = dict(row)
+
+        st.markdown("")
+
+        if already_issued:
+            st.markdown(f'<div class="warn">⚠️ تم صرف راتب هذا الموظف لشهر {MONTH_AR[sal_mo]} {sal_yr} مسبقاً.<br>رقم الكشف: <b>{already_issued["payslip_number"]}</b> — الصافي: <b>{already_issued["net_pay"]:,.2f} د.ل</b></div>', unsafe_allow_html=True)
+        else:
+            # Compute preview
+            try:
+                line = db.payroll_compute_line(sal_emp, sal_yr, sal_mo)
+            except Exception as e:
+                st.error(f"⚠️ {e}")
+                line = None
+
+            if line:
+                # ── Detail breakdown table (matches app style) ──
+                def _row(label, detail, amount, positive=None, sub=False):
+                    color = "#1B2A47"
+                    if positive is True:  color = "#27ae60"
+                    if positive is False: color = "#c0392b"
+                    pad = "padding-right:28px;" if sub else ""
+                    fw = "600" if sub else "700"
+                    fs = "13px" if sub else "14px"
+                    return f"""<tr>
+                        <td style="font-weight:{fw};color:{color};font-size:{fs};text-align:right;{pad}">{label}</td>
+                        <td style="text-align:center;color:#777;font-size:13px;">{detail}</td>
+                        <td style="font-weight:{fw};color:{color};font-size:{fs};text-align:right;white-space:nowrap;">{amount}</td>
+                    </tr>"""
+
+                rows_html = _row("💰 الراتب الأساسي", f"{line['working_days']} يوم عمل", f"{line['base_salary']:,.0f} د.ل")
+                for a in line["allowances"]:
+                    if a["category"] == "allowance":
+                        rows_html += _row(f"➕ {a['name_ar']}", "—", f"{a['amount']:,.0f} د.ل", positive=True, sub=True)
+                if line["absence_deduction"] > 0:
+                    rows_html += _row("➖ خصم الغياب", f"{line['absent_days']} يوم", f"({line['absence_deduction']:,.0f}) د.ل", positive=False, sub=True)
+                for a in line["allowances"]:
+                    if a["category"] == "deduction":
+                        rows_html += _row(f"➖ {a['name_ar']}", "—", f"({a['amount']:,.0f}) د.ل", positive=False, sub=True)
+                for inst in line["adv_instalments"]:
+                    rows_html += _row("➖ قسط سلفة", "—", f"({inst['amount']:,.0f}) د.ل", positive=False, sub=True)
+                for pen in line.get("pen_instalments", []):
+                    rows_html += _row(f"➖ عقوبة: {pen['reason']}", "—", f"({pen['amount']:,.0f}) د.ل", positive=False, sub=True)
+                if line.get("installment_paid", 0) > 0:
+                    rows_html += _row("➖ دفعات راتب مسحوبة خلال الشهر", "—", f"({line['installment_paid']:,.0f}) د.ل", positive=False, sub=True)
+
+                # Final total row
+                rows_html += f"""<tr style="background:#1B2A47;">
+                    <td style="font-weight:900;color:white;font-size:15px;padding:14px 16px;text-align:right;">✅ صافي الراتب المستحق</td>
+                    <td></td>
+                    <td style="font-weight:900;color:#C49A2A;font-size:15px;text-align:right;padding:14px 16px;white-space:nowrap;">{line['net_pay']:,.0f} د.ل</td>
+                </tr>"""
+
+                st.markdown(f"""
+                <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;border-radius:12px;overflow:hidden;box-shadow:0 2px 8px rgba(0,0,0,0.07);">
+                    <thead><tr style="background:#1B2A47;color:white;">
+                        <th style="padding:12px 16px;text-align:right;font-weight:700;">البند</th>
+                        <th style="padding:12px 16px;text-align:center;font-weight:700;">التفاصيل</th>
+                        <th style="padding:12px 16px;text-align:right;font-weight:700;">المبلغ</th>
+                    </tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+                <style>
+                table tbody tr:nth-child(even){{background:#f8fafc;}}
+                table tbody tr:hover:not(:last-child){{background:#edf2f7;transition:background 0.15s;}}
+                table tbody td{{padding:11px 16px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}
+                </style>
+                """, unsafe_allow_html=True)
+
+                st.markdown("")
+                st.markdown("")
+
+                # ── Carry-over notice ──
+                carry = line.get("installment_carry", 0)
+                if carry > 0:
+                    st.markdown(
+                        f'<div class="warn">⚠️ الموظف <b>{line["full_name"]}</b> سحب أقساط تتجاوز راتب هذا الشهر.<br>'
+                        f'سيتم خصم <b>{line["installment_paid"]:,.2f} د.ل</b> هذا الشهر (الراتب الكامل).<br>'
+                        f'المبلغ المتبقي <b>{carry:,.2f} د.ل</b> سيُرحّل تلقائياً ويُخصم من راتب الشهر التالي (كأقساط، ليس سلفة).</div>',
+                        unsafe_allow_html=True)
+                # Issue button
+                confirm = st.checkbox(f"أؤكد صرف راتب **{line['full_name']}** لشهر **{MONTH_AR[sal_mo]} {sal_yr}** بمبلغ **{line['net_pay']:,.2f} د.ل**", key="confirm_sal")
+                if st.button("💰 صرف الراتب الآن", type="primary", disabled=not confirm, use_container_width=True):
+                    try:
+                        with db.get_db() as _c:
+                            uid = _c.execute("SELECT id FROM users WHERE username=?", (st.session_state["username"],)).fetchone()
+                            finalized_by = uid["id"] if uid else 1
+                        ps_num, net = db.payroll_issue_individual(sal_emp, sal_yr, sal_mo, finalized_by)
+                        st.success(f"✅ تم صرف الراتب بنجاح — رقم الكشف: **{ps_num}** — الصافي: **{net:,.2f} د.ل**")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"⚠️ {e}")
+
 # ══════════════════════════════════════════════════════════════════
 # مسير الرواتب الشهري
 # ══════════════════════════════════════════════════════════════════
@@ -1738,6 +2173,591 @@ elif page == "📈 التقارير":
                            file_name=f"تكلفة_{mst_yr}_{mst_mo:02d}.csv", mime="text/csv")
 
 # ══════════════════════════════════════════════════════════════════
+# الحسابات (Accounts Ledger — generic party ledger)
+# ══════════════════════════════════════════════════════════════════
+elif page == "🧾 الحسابات":
+    require("all")
+    st.markdown('<div class="sh">🧾 الحسابات وكشوف الحساب</div>', unsafe_allow_html=True)
+    st.markdown('<div class="inf">💡 لكل جهة (مورد، وكيل...) حساب مستقل. نسجّل المستحقات (ما علينا) والمدفوعات — والرصيد يتراكم تلقائياً: <b>موجب = دين علينا</b>، <b>سالب = رصيد فائض لنا</b>.</div>', unsafe_allow_html=True)
+    st.markdown("")
+
+    accts = db.account_list()
+    if not accts:
+        st.warning("لا يوجد حساب مُسجَّل. أضف حساباً أولاً.")
+        with st.form("new_acct_form"):
+            nc_name = st.text_input("اسم الحساب *")
+            nc_phone = st.text_input("رقم الهاتف")
+            nc_notes = st.text_input("ملاحظات")
+            if st.form_submit_button("➕ إضافة حساب", type="primary"):
+                ok, msg = db.account_add(nc_name, nc_phone, nc_notes)
+                if ok: st.success(f"✅ {msg}"); st.rerun()
+                else: st.error(f"⚠️ {msg}")
+        st.stop()
+
+    def _acct_label(x):
+        a = next((a for a in accts if a["id"]==x), None)
+        if not a: return ""
+        return f"{a['name']}" + (f" — 📞 {a['phone']}" if a.get('phone') else "")
+    acct_sel = st.selectbox("اختر الحساب", [a["id"] for a in accts], format_func=_acct_label)
+
+    bal = db.account_balance(acct_sel)
+    if bal["balance"] > 0:
+        state_label, state_val_color = "علينا دين له", "#e74c3c"
+    elif bal["balance"] < 0:
+        state_label, state_val_color = "رصيد فائض لنا", "#C49A2A"
+    else:
+        state_label, state_val_color = "الحساب متوازن", "#C49A2A"
+
+    st.markdown(f"""
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:14px;font-family:'Cairo',sans-serif;direction:rtl;margin:12px 0 20px 0;">
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px 16px;border-top:4px solid #1B2A47;">
+            <div style="font-size:12px;color:#8a97a8;font-weight:600;margin-bottom:6px;">📥 إجمالي المستحقات</div>
+            <div style="font-size:22px;font-weight:900;color:#1B2A47;">{bal['total_charges']:,.0f}</div>
+            <div style="font-size:11px;color:#aaa;">د.ل</div>
+        </div>
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:18px 16px;border-top:4px solid #27ae60;">
+            <div style="font-size:12px;color:#8a97a8;font-weight:600;margin-bottom:6px;">💰 إجمالي المدفوع</div>
+            <div style="font-size:22px;font-weight:900;color:#27ae60;">{bal['total_paid']:,.0f}</div>
+            <div style="font-size:11px;color:#aaa;">د.ل</div>
+        </div>
+        <div style="background:linear-gradient(135deg,#1B2A47,#2c3e6b);border-radius:12px;padding:18px 16px;">
+            <div style="font-size:12px;color:#8AB0CC;font-weight:600;margin-bottom:6px;">⚖️ {state_label}</div>
+            <div style="font-size:24px;font-weight:900;color:{state_val_color};">{abs(bal['balance']):,.0f}</div>
+            <div style="font-size:11px;color:#8AB0CC;">د.ل</div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    tab_charge, tab_pay, tab_ledger, tab_list, tab_accts = st.tabs(
+        ["➕ تسجيل مستحق", "💰 تسجيل دفعة", "📊 كشف الحساب", "📋 المستحقات", "👤 الحسابات"])
+
+    with tab_charge:
+        with st.form("charge_form"):
+            c1, c2 = st.columns(2)
+            with c1:
+                ch_amount = st.number_input("المبلغ المستحق (د.ل) *", min_value=0.0, step=100.0)
+                ch_ref = st.text_input("رقم مرجعي", placeholder="فاتورة / طلبية / بوليصة... (اختياري)")
+            with c2:
+                ch_date = st.date_input("التاريخ", value=today)
+            ch_desc = st.text_input("الوصف *", placeholder="سبب المستحق / تفاصيله...")
+            sv_charge = st.form_submit_button("📥 تسجيل المستحق", type="primary")
+        if sv_charge:
+            if not ch_desc.strip():
+                st.error("الوصف مطلوب")
+            else:
+                ok, msg = db.charge_add(acct_sel, ch_amount, ch_date.isoformat(),
+                    ch_ref.strip(), ch_desc.strip(), st.session_state["username"])
+                if ok:
+                    with db.get_db() as _c:
+                        _row = _c.execute("SELECT id FROM account_charges ORDER BY id DESC LIMIT 1").fetchone()
+                        _lid = _row["id"] if _row else None
+                    track_action(f"مستحق {ch_amount:,.0f} د.ل — {ch_desc.strip()[:30]}", "charge", _lid)
+                    st.success(f"✅ {msg}"); st.rerun()
+                else:
+                    st.error(f"⚠️ {msg}")
+
+    with tab_pay:
+        acct_charges = db.charges_with_status(acct_sel)
+        charge_opts = [0] + [c["id"] for c in acct_charges]
+        def _charge_label(x):
+            if x == 0:
+                return "— دفعة عامة (غير مرتبطة بمستحق) —"
+            c = next((c for c in acct_charges if c["id"]==x), None)
+            if not c: return ""
+            refp = f"{c['reference']} · " if c.get('reference') else ""
+            return f"{refp}{c['description'][:35]} — متبقي {c['remaining_amount']:,.0f} د.ل"
+
+        with st.form("acc_pay_form"):
+            pay_charge = st.selectbox("المستحق المرتبط", charge_opts, format_func=_charge_label)
+            c1, c2 = st.columns(2)
+            with c1:
+                pay_amt = st.number_input("المبلغ (د.ل) *", min_value=1.0, step=100.0)
+                pay_type = st.selectbox("طريقة الدفع *", list(db.PAYMENT_TYPES_AR.keys()),
+                    format_func=lambda x: db.PAYMENT_TYPES_AR[x])
+            with c2:
+                pay_date = st.date_input("تاريخ الدفع", value=today)
+                pay_handler = st.text_input("مَن سلّم المبلغ / نفّذ العملية", placeholder="اسم الشخص الذي دفع أو حوّل")
+            pay_desc = st.text_input("الوصف", placeholder="دفعة عن كذا...")
+            pay_notes = st.text_input("ملاحظات", placeholder="أي تفاصيل إضافية...")
+            sv_pay = st.form_submit_button("💰 تسجيل الدفعة", type="primary")
+        if sv_pay:
+            ok, msg = db.payment_add(acct_sel, pay_amt, pay_date.isoformat(), pay_type,
+                pay_desc.strip(), pay_notes.strip(), st.session_state["username"],
+                charge_id=pay_charge if pay_charge else None,
+                handled_by=pay_handler.strip())
+            if ok:
+                with db.get_db() as _c:
+                    _row = _c.execute("SELECT id FROM account_payments ORDER BY id DESC LIMIT 1").fetchone()
+                    _lid = _row["id"] if _row else None
+                track_action(f"دفعة {pay_amt:,.0f} د.ل — {db.PAYMENT_TYPES_AR[pay_type]}", "acc_payment", _lid)
+                st.success(f"✅ {msg}"); st.rerun()
+            else:
+                st.error(f"⚠️ {msg}")
+
+    with tab_ledger:
+        # Date filter + print
+        fc1, fc2, fc3 = st.columns([2,2,2])
+        use_filter = fc1.checkbox("تصفية بالتاريخ", key="led_use_filter")
+        df_from = df_to = None
+        if use_filter:
+            df_from = fc2.date_input("من تاريخ", value=today.replace(day=1), key="led_from").isoformat()
+            df_to   = fc3.date_input("إلى تاريخ", value=today, key="led_to").isoformat()
+
+        ledger = db.account_ledger(acct_sel, date_from=df_from, date_to=df_to)
+
+        # Print PDF button
+        cur_acct_obj = next((a for a in accts if a["id"]==acct_sel), None)
+        if st.button("🖨️ طباعة كشف الحساب (PDF)", key="print_stmt", use_container_width=False):
+            try:
+                from account_pdf import generate_account_statement_pdf
+                pdf_path = generate_account_statement_pdf(cur_acct_obj, ledger, bal, df_from, df_to)
+                with open(pdf_path, "rb") as f:
+                    st.download_button("⬇️ تحميل كشف الحساب PDF", data=f.read(),
+                        file_name=pdf_path.name, mime="application/pdf",
+                        key="dl_stmt_pdf", use_container_width=True)
+            except Exception as e:
+                st.error(f"⚠️ فشل توليد PDF: {e}")
+
+        st.markdown("")
+        if ledger:
+            rows_html = ""
+            for l in ledger:
+                if l["tx_type"] == "charge":
+                    ref_str = f" ({l['ref']})" if l.get('ref') else ""
+                    icon, label, color = "📥", f"مستحق{ref_str}", "#c0392b"
+                    amt_str = f"+{l['debit']:,.0f}"
+                else:
+                    pay_for = f" · عن {l['paid_for_ref']}" if l.get('paid_for_ref') else ""
+                    handler = f" · بواسطة {l['handled_by']}" if l.get('handled_by') else ""
+                    icon, label, color = "💰", f"دفعة ({db.PAYMENT_TYPES_AR.get(l['ref'], l['ref'])}){pay_for}{handler}", "#27ae60"
+                    amt_str = f"-{l['credit']:,.0f}"
+                bal_color = "#c0392b" if l["running_balance"] > 0 else "#C49A2A"
+                rows_html += f"""<tr>
+                    <td style="color:#555;">{l['tx_date']}</td>
+                    <td style="font-weight:700;color:#1B2A47;">{icon} {label}</td>
+                    <td style="color:#777;">{l.get('description','') or '—'}</td>
+                    <td style="font-weight:700;color:{color};text-align:right;">{amt_str} د.ل</td>
+                    <td style="font-weight:900;color:{bal_color};text-align:right;">{l['running_balance']:,.0f} د.ل</td>
+                </tr>"""
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;">
+                <thead><tr style="background:#1B2A47;color:white;">
+                    <th style="padding:10px 14px;text-align:right;">التاريخ</th>
+                    <th style="padding:10px 14px;text-align:right;">العملية</th>
+                    <th style="padding:10px 14px;text-align:right;">الوصف</th>
+                    <th style="padding:10px 14px;text-align:right;">المبلغ</th>
+                    <th style="padding:10px 14px;text-align:right;">الرصيد بعد العملية</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+            <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+            table tbody tr:hover{{background:#edf2f7;}}
+            table tbody td{{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+            """, unsafe_allow_html=True)
+        else:
+            st.info("لا توجد حركات مسجلة بعد.")
+
+    with tab_list:
+        charges = db.charges_with_status(acct_sel)
+        if charges:
+            STATUS_AR = {"paid": "✅ مدفوع بالكامل", "partial": "🟡 مدفوع جزئياً", "unpaid": "🔴 غير مدفوع"}
+            STATUS_COLOR = {"paid": "#27ae60", "partial": "#f39c12", "unpaid": "#c0392b"}
+            rows_html = ""
+            for c in charges:
+                st_label = STATUS_AR.get(c["status"], c["status"])
+                st_color = STATUS_COLOR.get(c["status"], "#8a97a8")
+                rows_html += f"""<tr>
+                    <td style="color:#555;">{c.get('reference','') or '—'}</td>
+                    <td style="font-weight:700;color:#1B2A47;">{c['description']}</td>
+                    <td style="color:#555;">{c['charge_date']}</td>
+                    <td style="font-weight:700;color:#1B2A47;">{c['amount']:,.0f} د.ل</td>
+                    <td style="color:#27ae60;">{c['paid_amount']:,.0f} د.ل</td>
+                    <td style="color:#c0392b;">{c['remaining_amount']:,.0f} د.ل</td>
+                    <td style="text-align:center;"><span style="background:{st_color};color:white;padding:3px 10px;border-radius:10px;font-size:11px;font-weight:700;">{st_label}</span></td>
+                </tr>"""
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:13px;">
+                <thead><tr style="background:#1B2A47;color:white;">
+                    <th style="padding:10px 12px;text-align:right;">مرجع</th>
+                    <th style="padding:10px 12px;text-align:right;">الوصف</th>
+                    <th style="padding:10px 12px;text-align:right;">التاريخ</th>
+                    <th style="padding:10px 12px;text-align:right;">المبلغ</th>
+                    <th style="padding:10px 12px;text-align:right;">المدفوع</th>
+                    <th style="padding:10px 12px;text-align:right;">المتبقي</th>
+                    <th style="padding:10px 12px;text-align:center;">الحالة</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+            <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+            table tbody tr:hover{{background:#edf2f7;}}
+            table tbody td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+            """, unsafe_allow_html=True)
+
+            if can("all"):
+                st.markdown("---")
+                st.markdown("#### 🗑️ حذف مستحق")
+                c1, c2 = st.columns([3,1])
+                to_del = c1.selectbox("اختر المستحق",
+                    [c["id"] for c in charges],
+                    format_func=lambda x: next((f"{c['description'][:40]} — {c['amount']:,.0f} د.ل" for c in charges if c["id"]==x),""))
+                if c2.button("🗑️ حذف", type="primary"):
+                    ok, msg = db.charge_delete(to_del)
+                    if ok: st.success(f"✅ {msg}"); st.rerun()
+                    else: st.error(f"⚠️ {msg}")
+        else:
+            st.info("لا توجد مستحقات مسجلة بعد.")
+
+    with tab_accts:
+        st.markdown("#### ➕ إضافة حساب جديد")
+        with st.form("add_acct_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            with c1:
+                ac_name = st.text_input("اسم الحساب *", placeholder="الاسم الكامل")
+            with c2:
+                ac_phone = st.text_input("رقم الهاتف", placeholder="09xxxxxxxx")
+            ac_notes = st.text_input("ملاحظات", placeholder="نوع الحساب / أي تفاصيل...")
+            if st.form_submit_button("➕ إضافة الحساب", type="primary"):
+                ok, msg = db.account_add(ac_name, ac_phone, ac_notes)
+                if ok: st.success(f"✅ {msg}"); st.rerun()
+                else: st.error(f"⚠️ {msg}")
+
+        st.markdown("---")
+        st.markdown("#### 📋 قائمة الحسابات")
+        all_accts = db.account_list()
+        rows_html = ""
+        for a in all_accts:
+            ab = db.account_balance(a["id"])
+            bal_color = "#c0392b" if ab["balance"] > 0 else "#C49A2A"
+            rows_html += f"""<tr>
+                <td style="font-weight:700;color:#1B2A47;">{a['name']}</td>
+                <td style="color:#555;">{a.get('phone','') or '—'}</td>
+                <td style="color:#777;">{a.get('notes','') or '—'}</td>
+                <td style="font-weight:700;color:{bal_color};text-align:right;">{ab['balance']:,.0f} د.ل</td>
+            </tr>"""
+        st.markdown(f"""
+        <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;">
+            <thead><tr style="background:#1B2A47;color:white;">
+                <th style="padding:10px 14px;text-align:right;">الاسم</th>
+                <th style="padding:10px 14px;text-align:right;">الهاتف</th>
+                <th style="padding:10px 14px;text-align:right;">ملاحظات</th>
+                <th style="padding:10px 14px;text-align:right;">الرصيد</th>
+            </tr></thead>
+            <tbody>{rows_html}</tbody>
+        </table>
+        <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+        table tbody tr:hover{{background:#edf2f7;}}
+        table tbody td{{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+        """, unsafe_allow_html=True)
+
+        st.markdown("---")
+        st.markdown("#### ✏️ تعديل حساب")
+        edit_id = st.selectbox("اختر الحساب للتعديل", [a["id"] for a in all_accts],
+            format_func=lambda x: next((a["name"] for a in all_accts if a["id"]==x), ""),
+            key="edit_acct_pick")
+        cur_acct = next((a for a in all_accts if a["id"]==edit_id), None)
+        if cur_acct:
+            with st.form("edit_acct_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    ed_name = st.text_input("الاسم *", value=cur_acct["name"])
+                with c2:
+                    ed_phone = st.text_input("الهاتف", value=cur_acct.get("phone","") or "")
+                ed_notes = st.text_input("ملاحظات", value=cur_acct.get("notes","") or "")
+                c3, c4 = st.columns(2)
+                save_ed = c3.form_submit_button("💾 حفظ التعديل", type="primary", use_container_width=True)
+                deact = c4.form_submit_button("🚫 إخفاء الحساب", use_container_width=True)
+            if save_ed:
+                ok, msg = db.account_edit(edit_id, ed_name, ed_phone, ed_notes)
+                if ok: st.success(f"✅ {msg}"); st.rerun()
+                else: st.error(f"⚠️ {msg}")
+            if deact:
+                if len(all_accts) <= 1:
+                    st.error("⚠️ لا يمكن إخفاء الحساب الوحيد — أضف حساباً آخر أولاً.")
+                else:
+                    ok, msg = db.account_deactivate(edit_id)
+                    if ok: st.success(f"✅ {msg}"); st.rerun()
+                    else: st.error(f"⚠️ {msg}")
+
+# ══════════════════════════════════════════════════════════════════
+# عهدة الفروع (Branch Custody / Petty Cash)
+# ══════════════════════════════════════════════════════════════════
+elif page == "📦 عهدة الفروع":
+    require("all")
+    st.markdown('<div class="sh">📦 عهدة الفروع الشهرية</div>', unsafe_allow_html=True)
+    st.markdown('<div class="inf">💡 مبلغ نقدي مُخصص لكل فرع شهرياً لتغطية المصروفات اليومية (نظافة، قرطاسية، وقود...). المتبقي في نهاية الشهر يُرحّل تلقائياً للشهر التالي.</div>', unsafe_allow_html=True)
+    st.markdown("")
+
+    tab_view, tab_assign, tab_summary = st.tabs(["📋 عرض العهدة والمصروفات", "➕ تخصيص / إضافة مبلغ", "📊 ملخص كل الفروع"])
+
+    with tab_view:
+        c1, c2, c3 = st.columns(3)
+        bc_branch = c1.selectbox("الفرع", list(db.BRANCH_NAMES.keys()),
+            format_func=lambda x: db.BRANCH_NAMES[x], key="bc_branch")
+        bc_yr = c2.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="bc_yr")
+        bc_mo = c3.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="bc_mo")
+        mk_bc = f"{bc_yr:04d}-{bc_mo:02d}"
+
+        cust = db.branch_custody_get(bc_branch, mk_bc)
+
+        if not cust:
+            st.markdown(f'<div class="warn">⚠️ لا توجد عهدة مُخصصة لـ <b>{db.BRANCH_NAMES[bc_branch]}</b> في {MONTH_AR[bc_mo]} {bc_yr}. أضف تخصيص من تبويب "➕ تخصيص / إضافة مبلغ".</div>', unsafe_allow_html=True)
+        else:
+            # Balance cards
+            st.markdown(f"""
+            <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:12px;font-family:'Cairo',sans-serif;direction:rtl;margin:12px 0;">
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #1B2A47;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">💰 التخصيص الشهري</div>
+                    <div style="font-size:20px;font-weight:900;color:#1B2A47;">{cust['allocated_amount']:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #f39c12;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">🔄 مُرحّل من الشهر السابق</div>
+                    <div style="font-size:20px;font-weight:900;color:#f39c12;">{cust['carry_from_previous']:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+                <div style="background:#fff;border:1px solid #e2e8f0;border-radius:12px;padding:14px;border-top:4px solid #c0392b;">
+                    <div style="font-size:12px;color:#8a97a8;font-weight:600;">💸 المصروف ({cust['expense_count']} عملية)</div>
+                    <div style="font-size:20px;font-weight:900;color:#c0392b;">{cust['spent']:,.0f}<span style="font-size:12px;color:#aaa;"> د.ل</span></div>
+                </div>
+                <div style="background:linear-gradient(135deg,#1B2A47,#2c3e6b);border-radius:12px;padding:14px;">
+                    <div style="font-size:12px;color:#8AB0CC;font-weight:600;">✅ المتبقي</div>
+                    <div style="font-size:22px;font-weight:900;color:#C49A2A;">{cust['remaining']:,.0f}<span style="font-size:12px;color:#8AB0CC;"> د.ل</span></div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            # Status badge + close/reopen buttons + monthly print
+            is_closed = (cust.get("status") == "closed")
+            status_html = ('<span style="background:#c0392b;color:white;padding:4px 12px;border-radius:10px;font-weight:700;">🔒 مُقفل</span>'
+                           if is_closed else
+                           '<span style="background:#27ae60;color:white;padding:4px 12px;border-radius:10px;font-weight:700;">✅ مفتوح</span>')
+            st.markdown(f'<div style="margin:8px 0 12px 0;">حالة العهدة: {status_html}</div>', unsafe_allow_html=True)
+
+            action_c1, action_c2, action_c3 = st.columns([1,1,2])
+            if not is_closed:
+                if action_c1.button("🔒 إقفال الشهر", type="primary", use_container_width=True, key="btn_close_cust"):
+                    if st.session_state.get("_confirm_close") == mk_bc:
+                        ok, msg = db.branch_custody_close_month(bc_branch, mk_bc, st.session_state["username"])
+                        if ok:
+                            st.session_state.pop("_confirm_close", None)
+                            st.toast(f"✅ {msg}", icon="✅")
+                            st.rerun()
+                        else:
+                            st.error(f"⚠️ {msg}")
+                    else:
+                        st.session_state["_confirm_close"] = mk_bc
+                        st.warning("⚠️ اضغط مرة أخرى للتأكيد. سيتم إقفال هذا الشهر وترحيل المتبقي تلقائياً للشهر التالي.")
+            else:
+                if can("all") and action_c1.button("🔓 إعادة فتح الشهر", use_container_width=True, key="btn_reopen_cust"):
+                    ok, msg = db.branch_custody_reopen_month(bc_branch, mk_bc, st.session_state["username"])
+                    if ok: st.toast(f"✅ {msg}", icon="✅"); st.rerun()
+                    else: st.error(f"⚠️ {msg}")
+
+            # Monthly PDF print
+            if action_c2.button("🖨️ طباعة كشف الشهر (PDF)", use_container_width=True, key="btn_print_month"):
+                try:
+                    from custody_pdf import generate_custody_monthly_pdf
+                    exps_pdf = db.branch_custody_expense_list(bc_branch, mk_bc)
+                    pdf_path = generate_custody_monthly_pdf(cust, exps_pdf, db.BRANCH_NAMES[bc_branch], mk_bc)
+                    with open(pdf_path, "rb") as f:
+                        st.download_button(
+                            "⬇️ تحميل ملف PDF",
+                            data=f.read(),
+                            file_name=pdf_path.name,
+                            mime="application/pdf",
+                            key="dl_month_pdf",
+                            use_container_width=True,
+                        )
+                except Exception as e:
+                    st.error(f"⚠️ فشل توليد PDF: {e}")
+
+            st.markdown("---")
+
+            # Add expense form (disabled if closed)
+            if is_closed:
+                st.markdown('<div class="warn">🔒 العهدة مُقفلة — لا يمكن تسجيل مصروفات جديدة. لإعادة الفتح استخدم الزر أعلاه (أدمن فقط).</div>', unsafe_allow_html=True)
+            else:
+                st.markdown("#### ➕ تسجيل مصروف")
+                saved_reasons = db.branch_custody_reason_list()
+                OTHER_OPT = "➕ أخرى — أضف سبباً جديداً"
+                reason_options = saved_reasons + [OTHER_OPT] if saved_reasons else [OTHER_OPT]
+
+                picked_reason = st.selectbox("السبب *",
+                    reason_options, key="bc_reason_pick",
+                    help="اختر من الأسباب السابقة، أو ✚ أخرى لإضافة سبب جديد")
+                new_reason = ""
+                if picked_reason == OTHER_OPT:
+                    new_reason = st.text_input("السبب الجديد *",
+                        placeholder="اكتب السبب — سيُحفظ للمرات القادمة",
+                        key="bc_new_reason")
+
+                with st.form("bc_exp_form", clear_on_submit=True):
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        exp_amt = st.number_input("المبلغ (د.ل) *", min_value=1.0, step=10.0)
+                    with c2:
+                        exp_date = st.date_input("تاريخ المصروف", value=today)
+                    st.markdown(f'<div style="padding:8px 12px;background:#f8fafc;border-radius:8px;border:1px solid #e2e8f0;color:#1B2A47;font-weight:600;">📝 {new_reason or (picked_reason if picked_reason != OTHER_OPT else "—")}</div>', unsafe_allow_html=True)
+                    sv_exp = st.form_submit_button("💸 تسجيل المصروف", type="primary")
+                if sv_exp:
+                    final_reason = new_reason.strip() if picked_reason == OTHER_OPT else picked_reason
+                    if not final_reason:
+                        st.error("⚠️ اكتب السبب الجديد قبل التسجيل")
+                    elif exp_amt > cust["remaining"]:
+                        st.error(f"⚠️ المبلغ ({exp_amt:,.0f} د.ل) أكبر من الرصيد المتبقي ({cust['remaining']:,.0f} د.ل)")
+                    else:
+                        ok, msg = db.branch_custody_expense_add(bc_branch, mk_bc, exp_amt,
+                            final_reason, "", exp_date.isoformat(), st.session_state["username"])
+                        if ok:
+                            with db.get_db() as _c:
+                                _row = _c.execute("SELECT id FROM branch_custody_expenses ORDER BY id DESC LIMIT 1").fetchone()
+                                _lid = _row["id"] if _row else None
+                            track_action(f"مصروف عهدة {exp_amt:,.0f} د.ل — {final_reason}", "custody_expense", _lid)
+                            st.success(f"✅ {msg}"); st.rerun()
+                        else:
+                            st.error(f"⚠️ {msg}")
+
+            # Expenses table
+            st.markdown("")
+            st.markdown("#### 📋 سجل المصروفات")
+            exps = db.branch_custody_expense_list(bc_branch, mk_bc)
+            if exps:
+                rows_html = ""
+                for e in exps:
+                    rows_html += f"""<tr>
+                        <td style="color:#555;">{e['expense_date']}</td>
+                        <td style="font-weight:700;color:#1B2A47;">{e['description']}</td>
+                        <td style="font-weight:700;color:#c0392b;text-align:right;">{e['amount']:,.0f} د.ل</td>
+                        <td style="color:#555;font-size:12px;">{e.get('logged_by','—')}</td>
+                    </tr>"""
+                st.markdown(f"""
+                <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;">
+                    <thead><tr style="background:#1B2A47;color:white;">
+                        <th style="padding:10px 14px;text-align:right;">التاريخ</th>
+                        <th style="padding:10px 14px;text-align:right;">السبب</th>
+                        <th style="padding:10px 14px;text-align:right;">المبلغ</th>
+                        <th style="padding:10px 14px;text-align:right;">بواسطة</th>
+                    </tr></thead>
+                    <tbody>{rows_html}</tbody>
+                </table>
+                <style>table tbody tr:nth-child(even){{background:#f8fafc;}}
+                table tbody tr:hover{{background:#edf2f7;}}
+                table tbody td{{padding:10px 14px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+                """, unsafe_allow_html=True)
+
+                # Per-expense PDF receipt
+                st.markdown("---")
+                st.markdown("#### 🖨️ طباعة سند صرف")
+                pc1, pc2 = st.columns([3,1])
+                to_print = pc1.selectbox("اختر مصروف لطباعة سند صرف",
+                    [e["id"] for e in exps],
+                    format_func=lambda x: next((f"{e['expense_date']} — {e['description'][:40]} ({e['amount']:,.0f} د.ل)" for e in exps if e["id"]==x),""),
+                    key="bc_print_pick")
+                if pc2.button("🖨️ توليد سند", use_container_width=True, key="btn_print_receipt"):
+                    try:
+                        from custody_pdf import generate_expense_receipt_pdf
+                        picked = next((e for e in exps if e["id"] == to_print), None)
+                        pdf_path = generate_expense_receipt_pdf(picked, db.BRANCH_NAMES[bc_branch], mk_bc)
+                        with open(pdf_path, "rb") as f:
+                            st.download_button(
+                                "⬇️ تحميل سند الصرف",
+                                data=f.read(),
+                                file_name=pdf_path.name,
+                                mime="application/pdf",
+                                key="dl_receipt_pdf",
+                                use_container_width=True,
+                            )
+                    except Exception as e:
+                        st.error(f"⚠️ فشل توليد PDF: {e}")
+
+                # Delete button
+                st.markdown("---")
+                st.markdown("#### 🗑️ حذف مصروف")
+                c1, c2 = st.columns([3,1])
+                to_del = c1.selectbox("اختر المصروف",
+                    [e["id"] for e in exps],
+                    format_func=lambda x: next((f"{e['expense_date']} — {e['description']} ({e['amount']:,.0f} د.ل)" for e in exps if e["id"]==x),""),
+                    key="bc_del_pick")
+                if c2.button("🗑️ حذف", type="primary"):
+                    ok, msg = db.branch_custody_expense_delete(to_del)
+                    if ok: st.success(f"✅ {msg}"); st.rerun()
+                    else: st.error(f"⚠️ {msg}")
+            else:
+                st.info("لا توجد مصروفات مسجلة بعد.")
+
+    with tab_assign:
+        st.markdown("#### ➕ تخصيص أو إضافة عهدة للفرع")
+        st.caption("عند التخصيص الأول للشهر، تُضاف تلقائياً المُرحّلات من الشهر السابق.")
+
+        with st.form("bc_assign_form"):
+            c1, c2, c3 = st.columns(3)
+            asg_branch = c1.selectbox("الفرع *", list(db.BRANCH_NAMES.keys()),
+                format_func=lambda x: db.BRANCH_NAMES[x], key="asg_branch")
+            asg_yr = c2.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="asg_yr")
+            asg_mo = c3.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="asg_mo")
+            asg_amt = st.number_input("مبلغ العهدة (د.ل) *", min_value=1.0, step=100.0)
+            asg_notes = st.text_input("ملاحظات", placeholder="سبب / تفاصيل التخصيص...")
+            sv_asg = st.form_submit_button("📦 تخصيص العهدة", type="primary")
+        if sv_asg:
+            mk_asg = f"{asg_yr:04d}-{asg_mo:02d}"
+            ok, msg = db.branch_custody_assign(asg_branch, mk_asg, asg_amt,
+                asg_notes.strip(), st.session_state["username"])
+            if ok:
+                st.success(f"✅ {msg}"); st.rerun()
+            else:
+                st.error(f"⚠️ {msg}")
+
+    with tab_summary:
+        c1, c2 = st.columns(2)
+        sum_yr = c1.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="bcsum_yr")
+        sum_mo = c2.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="bcsum_mo")
+        mk_sum = f"{sum_yr:04d}-{sum_mo:02d}"
+        summary = db.branch_custody_summary(mk_sum)
+        if summary:
+            rows_html = ""
+            total_alloc = 0; total_carry = 0; total_spent = 0; total_rem = 0
+            for s in summary:
+                total_alloc += s["allocated"]; total_carry += s["carry_from_previous"]
+                total_spent += s["spent"];    total_rem += s["remaining"]
+                pct = round(s["spent"] / s["total_available"] * 100, 1) if s["total_available"] > 0 else 0
+                bar_color = "#c0392b" if pct >= 90 else "#f39c12" if pct >= 50 else "#27ae60"
+                rows_html += f"""<tr>
+                    <td style="font-weight:700;color:#1B2A47;">{s['branch_name']}</td>
+                    <td style="text-align:right;color:#1B2A47;">{s['allocated']:,.0f} د.ل</td>
+                    <td style="text-align:right;color:#f39c12;">{s['carry_from_previous']:,.0f} د.ل</td>
+                    <td style="text-align:right;font-weight:600;">{s['total_available']:,.0f} د.ل</td>
+                    <td style="text-align:right;color:#c0392b;">{s['spent']:,.0f} د.ل ({s['expense_count']})</td>
+                    <td style="text-align:right;font-weight:700;color:#27ae60;">{s['remaining']:,.0f} د.ل</td>
+                    <td style="text-align:center;"><span style="background:{bar_color};color:white;padding:3px 12px;border-radius:10px;font-size:12px;font-weight:700;">{pct}%</span></td>
+                </tr>"""
+            rows_html += f"""<tr style="background:#1B2A47;">
+                <td style="font-weight:900;color:white;padding:14px 16px;">🏁 الإجمالي</td>
+                <td style="color:#C49A2A;text-align:right;font-weight:900;padding:14px 16px;">{total_alloc:,.0f} د.ل</td>
+                <td style="color:#C49A2A;text-align:right;font-weight:900;padding:14px 16px;">{total_carry:,.0f} د.ل</td>
+                <td style="color:#C49A2A;text-align:right;font-weight:900;padding:14px 16px;">{(total_alloc+total_carry):,.0f} د.ل</td>
+                <td style="color:#C49A2A;text-align:right;font-weight:900;padding:14px 16px;">{total_spent:,.0f} د.ل</td>
+                <td style="color:#C49A2A;text-align:right;font-weight:900;padding:14px 16px;">{total_rem:,.0f} د.ل</td>
+                <td></td>
+            </tr>"""
+            st.markdown(f"""
+            <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:13px;margin-top:8px;">
+                <thead><tr style="background:#2c3e6b;color:white;">
+                    <th style="padding:10px 12px;text-align:right;">الفرع</th>
+                    <th style="padding:10px 12px;text-align:right;">التخصيص</th>
+                    <th style="padding:10px 12px;text-align:right;">مُرحّل</th>
+                    <th style="padding:10px 12px;text-align:right;">المتاح</th>
+                    <th style="padding:10px 12px;text-align:right;">المصروف</th>
+                    <th style="padding:10px 12px;text-align:right;">المتبقي</th>
+                    <th style="padding:10px 12px;text-align:center;">نسبة الصرف</th>
+                </tr></thead>
+                <tbody>{rows_html}</tbody>
+            </table>
+            <style>table tbody tr:nth-child(even):not(:last-child){{background:#f8fafc;}}
+            table tbody tr:hover:not(:last-child){{background:#edf2f7;}}
+            table tbody td{{padding:10px 12px;border-bottom:1px solid #e2e8f0;vertical-align:middle;}}</style>
+            """, unsafe_allow_html=True)
+        else:
+            st.info(f"لا توجد عهدة مخصصة لأي فرع في {MONTH_AR[sum_mo]} {sum_yr}.")
+
+# ══════════════════════════════════════════════════════════════════
 # مصروفات الشركة (Company Expenses)
 # ══════════════════════════════════════════════════════════════════
 elif page == "📒 مصروفات الشركة":
@@ -1754,6 +2774,9 @@ elif page == "📒 مصروفات الشركة":
             with c1:
                 exp_cat = st.selectbox("التصنيف *", db.EXPENSE_CATEGORIES)
                 exp_amt = st.number_input("المبلغ (د.ل) *", min_value=1.0, step=50.0)
+                exp_branch = st.selectbox("الفرع",
+                    [""] + list(db.BRANCH_NAMES.keys()),
+                    format_func=lambda x: "🏢 عام (كل الشركة)" if x == "" else db.BRANCH_NAMES[x])
             with c2:
                 exp_date = st.date_input("التاريخ", value=today)
                 exp_desc = st.text_input("ملاحظات", placeholder="تفاصيل إضافية...")
@@ -1761,26 +2784,46 @@ elif page == "📒 مصروفات الشركة":
         if sv_exp:
             mk = exp_date.strftime("%Y-%m")
             ok, msg = db.expense_add(exp_cat, exp_amt, exp_date.isoformat(), mk,
-                exp_desc.strip(), st.session_state["username"])
+                exp_desc.strip(), st.session_state["username"],
+                branch_id=exp_branch if exp_branch else None)
             if ok:
+                with db.get_db() as _c:
+                    _row = _c.execute("SELECT id FROM company_expenses ORDER BY id DESC LIMIT 1").fetchone()
+                    _lid = _row["id"] if _row else None
+                b_label = f" — {db.BRANCH_NAMES.get(exp_branch, exp_branch)}" if exp_branch else " — عام"
+                track_action(f"مصروف شركة {exp_amt:,.0f} د.ل — {exp_cat}{b_label}", "expense", _lid)
                 st.success(f"✅ {msg}")
                 st.rerun()
             else:
                 st.error(f"⚠️ {msg}")
 
     with tab_list:
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         exp_yr = c1.selectbox("السنة", list(range(2022, today.year+2)), index=today.year-2022, key="exp_yr")
         exp_mo = c2.selectbox("الشهر", list(range(1,13)), format_func=lambda m: MONTH_AR[m], index=today.month-1, key="exp_mo")
+        exp_bfilter = c3.selectbox("الفرع",
+            ["all", ""] + list(db.BRANCH_NAMES.keys()),
+            format_func=lambda x: "الكل" if x=="all" else ("🏢 عام" if x=="" else db.BRANCH_NAMES[x]),
+            key="exp_bfilter")
         mk = f"{exp_yr:04d}-{exp_mo:02d}"
-        expenses = db.expense_list(month_key=mk)
+        if exp_bfilter == "all":
+            expenses = db.expense_list(month_key=mk)
+        elif exp_bfilter == "":
+            expenses = [e for e in db.expense_list(month_key=mk) if not e.get("branch_id")]
+        else:
+            expenses = db.expense_list(month_key=mk, branch_id=exp_bfilter)
+
         if expenses:
             rows_html = ""
             total_exp = 0
             for e in expenses:
                 total_exp += e["amount"]
+                bid = e.get("branch_id")
+                b_label = db.BRANCH_NAMES.get(bid, "🏢 عام") if bid else "🏢 عام"
+                b_color = "#2980b9" if bid else "#8a97a8"
                 rows_html += f"""<tr>
                     <td style="font-weight:600;color:#1B2A47;"><span style="background:#8e44ad;color:white;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700;">{e['category']}</span></td>
+                    <td><span style="background:{b_color};color:white;padding:2px 8px;border-radius:8px;font-size:11px;font-weight:700;">{b_label}</span></td>
                     <td style="font-weight:700;color:#c0392b;">{e['amount']:,.0f} د.ل</td>
                     <td style="color:#555;">{e['expense_date']}</td>
                     <td style="color:#555;">{e.get('description','') or '—'}</td>
@@ -1790,6 +2833,7 @@ elif page == "📒 مصروفات الشركة":
             <table style="width:100%;border-collapse:collapse;font-family:'Cairo',sans-serif;direction:rtl;font-size:14px;margin-top:8px;">
                 <thead><tr style="background:#1B2A47;color:white;">
                     <th style="padding:10px 14px;text-align:right;">التصنيف</th>
+                    <th style="padding:10px 14px;text-align:right;">الفرع</th>
                     <th style="padding:10px 14px;text-align:right;">المبلغ</th>
                     <th style="padding:10px 14px;text-align:right;">التاريخ</th>
                     <th style="padding:10px 14px;text-align:right;">ملاحظات</th>

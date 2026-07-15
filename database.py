@@ -246,7 +246,8 @@ def init_db():
             line_id        INTEGER NOT NULL REFERENCES payroll_lines(id),
             item_type      TEXT    NOT NULL
                            CHECK(item_type IN ('allowance','deduction','advance_deduction',
-                                               'absence_deduction','bonus','penalty_deduction')),
+                                               'absence_deduction','bonus','penalty_deduction',
+                                               'installment_deduction')),
             description_ar TEXT    NOT NULL,
             amount         REAL    NOT NULL,
             reference_id   INTEGER
@@ -333,12 +334,96 @@ def init_db():
             amount REAL NOT NULL CHECK(amount > 0),
             expense_date TEXT NOT NULL,
             month_key TEXT NOT NULL,
+            branch_id TEXT,
             description TEXT,
             logged_by TEXT,
             created_at TEXT NOT NULL DEFAULT (datetime('now'))
         );
 
+        CREATE TABLE IF NOT EXISTS branch_custody (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            branch_id TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            allocated_amount REAL NOT NULL CHECK(allocated_amount >= 0),
+            carry_from_previous REAL NOT NULL DEFAULT 0,
+            notes TEXT,
+            assigned_by TEXT,
+            status TEXT NOT NULL DEFAULT 'open',
+            closed_at TEXT,
+            closed_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(branch_id, month_key)
+        );
+
+        CREATE TABLE IF NOT EXISTS branch_custody_expenses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            custody_id INTEGER NOT NULL REFERENCES branch_custody(id) ON DELETE CASCADE,
+            amount REAL NOT NULL CHECK(amount > 0),
+            description TEXT NOT NULL,
+            expense_date TEXT NOT NULL,
+            category TEXT,
+            logged_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_bcust_branch ON branch_custody(branch_id, month_key);
+        CREATE INDEX IF NOT EXISTS idx_bcust_exp_cust ON branch_custody_expenses(custody_id);
+
+        CREATE TABLE IF NOT EXISTS accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            phone TEXT,
+            notes TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS account_charges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            amount REAL NOT NULL CHECK(amount >= 0),
+            charge_date TEXT NOT NULL,
+            reference TEXT,
+            description TEXT,
+            logged_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE TABLE IF NOT EXISTS account_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL REFERENCES accounts(id),
+            charge_id INTEGER REFERENCES account_charges(id),
+            amount REAL NOT NULL CHECK(amount > 0),
+            payment_date TEXT NOT NULL,
+            payment_type TEXT NOT NULL CHECK(payment_type IN ('cash','transfer')),
+            handled_by TEXT,
+            description TEXT,
+            notes TEXT,
+            logged_by TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_charges_account  ON account_charges(account_id);
+        CREATE INDEX IF NOT EXISTS idx_charges_date     ON account_charges(charge_date);
+        CREATE INDEX IF NOT EXISTS idx_accpay_account   ON account_payments(account_id);
+        CREATE INDEX IF NOT EXISTS idx_accpay_date      ON account_payments(payment_date);
+
+        CREATE TABLE IF NOT EXISTS salary_installments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            employee_id INTEGER NOT NULL REFERENCES employees(id) ON DELETE CASCADE,
+            amount REAL NOT NULL CHECK(amount > 0),
+            pay_date TEXT NOT NULL,
+            month_key TEXT NOT NULL,
+            description TEXT,
+            approved_by TEXT,
+            logged_by TEXT,
+            settled INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+
         CREATE INDEX IF NOT EXISTS idx_expense_month ON company_expenses(month_key);
+        CREATE INDEX IF NOT EXISTS idx_salinst_emp   ON salary_installments(employee_id);
+        CREATE INDEX IF NOT EXISTS idx_salinst_month ON salary_installments(month_key);
         CREATE INDEX IF NOT EXISTS idx_custody_emp ON custody_items(employee_id);
         CREATE INDEX IF NOT EXISTS idx_custody_status ON custody_items(status);
         CREATE INDEX IF NOT EXISTS idx_cash_emp ON cash_payments(employee_id);
@@ -368,11 +453,73 @@ def init_db():
 def _migrate_db():
     """Apply schema migrations that cannot be handled by CREATE TABLE IF NOT EXISTS."""
     with get_db() as conn:
+        # ── Add status/closed columns to branch_custody if missing ──
+        try:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(branch_custody)").fetchall()]
+            if "status" not in cols:
+                conn.execute("ALTER TABLE branch_custody ADD COLUMN status TEXT NOT NULL DEFAULT 'open'")
+            if "closed_at" not in cols:
+                conn.execute("ALTER TABLE branch_custody ADD COLUMN closed_at TEXT")
+            if "closed_by" not in cols:
+                conn.execute("ALTER TABLE branch_custody ADD COLUMN closed_by TEXT")
+        except Exception:
+            pass
+        # ── Add branch_id to company_expenses ──
+        try:
+            cols = [r["name"] for r in conn.execute("PRAGMA table_info(company_expenses)").fetchall()]
+            if "branch_id" not in cols:
+                conn.execute("ALTER TABLE company_expenses ADD COLUMN branch_id TEXT")
+        except Exception:
+            pass
+        # ── Migrate old customs tables (customs_agents/shipments/agent_payments)
+        #    into the generic ledger (accounts/account_charges/account_payments).
+        #    IDs are preserved so payment→charge links stay intact. ──
+        try:
+            def _has_table(nm):
+                return conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (nm,)
+                ).fetchone() is not None
+
+            if _has_table("customs_agents"):
+                acc_empty = conn.execute("SELECT COUNT(*) as c FROM accounts").fetchone()["c"] == 0
+                if acc_empty:
+                    conn.execute("""
+                        INSERT INTO accounts(id,name,phone,notes,is_active,created_at)
+                        SELECT id,name,phone,notes,is_active,created_at FROM customs_agents
+                    """)
+                if _has_table("shipments") and conn.execute("SELECT COUNT(*) as c FROM account_charges").fetchone()["c"] == 0:
+                    # Fold customs-specific fields into description/reference
+                    conn.execute("""
+                        INSERT INTO account_charges(id,account_id,amount,charge_date,reference,description,logged_by,created_at)
+                        SELECT id, agent_id, amount_lyd, delivery_date,
+                               COALESCE(NULLIF(order_number,''), bol_number),
+                               TRIM(COALESCE(description,'') || ' [' ||
+                                    COALESCE(container_count,'') || 'x' || COALESCE(container_size,'') ||
+                                    ' - بوليصة ' || COALESCE(bol_number,'') || ']'),
+                               logged_by, created_at
+                        FROM shipments
+                    """)
+                if _has_table("agent_payments") and conn.execute("SELECT COUNT(*) as c FROM account_payments").fetchone()["c"] == 0:
+                    conn.execute("""
+                        INSERT INTO account_payments(id,account_id,charge_id,amount,payment_date,
+                            payment_type,handled_by,description,notes,logged_by,created_at)
+                        SELECT id, agent_id, shipment_id, amount, payment_date,
+                               payment_type, handled_by, description, notes, logged_by, created_at
+                        FROM agent_payments
+                    """)
+                # Drop the old customs tables now that data is migrated
+                conn.executescript("""
+                    DROP TABLE IF EXISTS agent_payments;
+                    DROP TABLE IF EXISTS shipments;
+                    DROP TABLE IF EXISTS customs_agents;
+                """)
+        except Exception:
+            pass  # migration is best-effort; new tables already exist and work standalone
         # ── Fix payroll_items CHECK constraint to include penalty_deduction ──
         row = conn.execute("""
             SELECT sql FROM sqlite_master WHERE type='table' AND name='payroll_items'
         """).fetchone()
-        if row and "penalty_deduction" not in row["sql"]:
+        if row and "installment_deduction" not in row["sql"]:
             conn.executescript("""
                 PRAGMA foreign_keys=OFF;
                 BEGIN;
@@ -381,7 +528,8 @@ def _migrate_db():
                     line_id     INTEGER NOT NULL REFERENCES payroll_lines(id) ON DELETE CASCADE,
                     item_type   TEXT NOT NULL
                                 CHECK(item_type IN ('allowance','deduction','advance_deduction',
-                                                    'absence_deduction','bonus','penalty_deduction')),
+                                                    'absence_deduction','bonus','penalty_deduction',
+                                                    'installment_deduction')),
                     description_ar TEXT,
                     amount      REAL NOT NULL DEFAULT 0,
                     reference_id INTEGER
@@ -748,9 +896,17 @@ def payroll_compute_line(emp_id:int,year:int,month:int)->dict:
     adv_ded     = round(sum(i["amount"] for i in adv_insts),2)
     pen_insts   = penalty_deductions_month(emp_id,year,month)
     pen_ded     = round(sum(p["amount"] for p in pen_insts),2)
-    gross       = round(base+alw_sum,2)
-    total_ded   = round(absence_ded+alw_ded+adv_ded+pen_ded,2)
-    net         = round(max(0.0,gross-total_ded),2)
+    # Salary installments: total pending across all unsettled months
+    inst_pending = round(salary_installment_pending_total(emp_id,year,month),2)
+    gross        = round(base+alw_sum,2)
+    fixed_ded    = round(absence_ded+alw_ded+adv_ded+pen_ded,2)
+    # Amount available to apply against installments this month
+    avail_for_inst = max(0.0, gross - fixed_ded)
+    inst_applied   = round(min(inst_pending, avail_for_inst),2)
+    inst_carry     = round(max(0.0, inst_pending - inst_applied),2)
+    inst_paid      = inst_applied  # for payslip display
+    total_ded      = round(fixed_ded + inst_applied,2)
+    net            = round(max(0.0,gross-total_ded),2)
 
     # Build line_items for payslip display
     line_items = []
@@ -789,6 +945,13 @@ def payroll_compute_line(emp_id:int,year:int,month:int)->dict:
                 "desc": f"عقوبة: {pen['reason']}",
                 "amount": pen["amount"],
             })
+        if inst_paid > 0:
+            desc_i = "أقساط راتب مُخصمة" if inst_carry == 0 else f"أقساط راتب مُخصمة (متبقي {inst_carry:,.0f} د.ل يُرحّل)"
+            line_items.append({
+                "type": "installment",
+                "desc": desc_i,
+                "amount": inst_paid,
+            })
 
     return {
         # Core identifiers
@@ -821,6 +984,10 @@ def payroll_compute_line(emp_id:int,year:int,month:int)->dict:
         # Penalties
         "pen_instalments":   pen_insts,
         "penalty_deduction": pen_ded,
+        # Salary installments (partial salary paid during month)
+        "installment_paid":     inst_paid,      # applied deduction this month
+        "installment_pending":  inst_pending,   # total pending (past + current)
+        "installment_carry":    inst_carry,     # rolls over to next month
         # Salary hold
         "is_held":           is_held,
         # Totals
@@ -850,15 +1017,42 @@ def payroll_finalize(year:int,month:int,finalized_by:int)->int:
         ).fetchone()
         if existing and existing["status"] == "finalized":
             raise ValueError(f"مسير {mk} مُقفل مسبقاً")
-        lines = payroll_preview(year,month)
-        if not lines: raise ValueError("لا يوجد موظفون نشطون")
-        total_gross      = sum(l["gross"] for l in lines)
-        total_deductions = sum(l["total_deductions"] for l in lines)
-        total_net        = sum(l["net_pay"] for l in lines)
+
+        # Get employees already issued individually (draft period)
+        already_paid_emp_ids = set()
+        existing_totals = {"gross": 0.0, "ded": 0.0, "net": 0.0, "count": 0}
+        if existing:
+            rows = conn.execute("""
+                SELECT employee_id, gross, total_deductions, net_pay
+                FROM payroll_lines WHERE period_id=?
+            """, (existing["id"],)).fetchall()
+            for r in rows:
+                already_paid_emp_ids.add(r["employee_id"])
+                existing_totals["gross"] += r["gross"]
+                existing_totals["ded"]   += r["total_deductions"]
+                existing_totals["net"]   += r["net_pay"]
+                existing_totals["count"] += 1
+
+        # Compute lines only for employees not already individually issued
+        all_lines = payroll_preview(year, month)
+        lines_to_add = [l for l in all_lines if l["employee_id"] not in already_paid_emp_ids]
+
+        if not all_lines: raise ValueError("لا يوجد موظفون نشطون")
+        if not lines_to_add and not already_paid_emp_ids:
+            raise ValueError("لا يوجد موظفون نشطون")
+
+
+        new_gross = sum(l["gross"] for l in lines_to_add)
+        new_ded   = sum(l["total_deductions"] for l in lines_to_add)
+        new_net   = sum(l["net_pay"] for l in lines_to_add)
+
+        total_gross      = existing_totals["gross"] + new_gross
+        total_deductions = existing_totals["ded"]   + new_ded
+        total_net        = existing_totals["net"]   + new_net
+        total_count      = existing_totals["count"] + len(lines_to_add)
         fin_at           = datetime.now().isoformat()
 
         if existing:
-            # Draft exists (was reopened) — update in place and wipe old lines
             period_id = existing["id"]
             conn.execute("""
                 UPDATE payroll_periods
@@ -866,23 +1060,19 @@ def payroll_finalize(year:int,month:int,finalized_by:int)->int:
                     total_net=?, employee_count=?, finalized_at=?, finalized_by=?
                 WHERE id=?
             """, (total_gross, total_deductions, total_net,
-                  len(lines), fin_at, finalized_by, period_id))
-            # Remove old payroll lines so we can re-insert clean ones
-            old_line_ids = [r["id"] for r in conn.execute(
-                "SELECT id FROM payroll_lines WHERE period_id=?", (period_id,)
-            ).fetchall()]
-            for lid in old_line_ids:
-                conn.execute("DELETE FROM payroll_items WHERE line_id=?", (lid,))
-            conn.execute("DELETE FROM payroll_lines WHERE period_id=?", (period_id,))
+                  total_count, fin_at, finalized_by, period_id))
         else:
             cur = conn.execute("""
                 INSERT INTO payroll_periods(month_key,year,month,status,
                     total_gross,total_deductions,total_net,employee_count,finalized_at,finalized_by)
                 VALUES(?,?,?,'finalized',?,?,?,?,?,?)
             """, (mk, year, month, total_gross, total_deductions, total_net,
-                  len(lines), fin_at, finalized_by))
+                  total_count, fin_at, finalized_by))
             period_id = cur.lastrowid
-        for i,line in enumerate(lines,1):
+
+        # Determine starting payslip number (continue from existing)
+        start_idx = existing_totals["count"]
+        for i, line in enumerate(lines_to_add, start_idx + 1):
             ps_num = f"PSL-{year}-{month:02d}-{i:04d}"
             cur2 = conn.execute("""
                 INSERT INTO payroll_lines(period_id,employee_id,employee_snapshot,
@@ -915,9 +1105,117 @@ def payroll_finalize(year:int,month:int,finalized_by:int)->int:
                 conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount,reference_id) VALUES(?,'penalty_deduction',?,?,?)",
                              (line_id,f"عقوبة: {pen['reason']}",pen["amount"],pen["id"]))
                 conn.execute("UPDATE penalties SET deducted=1 WHERE id=?",(pen["id"],))
+            # Salary installments — mark as settled and add as single payroll_item line
+            inst_paid = line.get("installment_paid", 0)
+            inst_carry = line.get("installment_carry", 0)
+            if inst_paid > 0:
+                desc_i = "أقساط راتب مُخصمة" if inst_carry == 0 else f"أقساط راتب مُخصمة (متبقي {inst_carry:,.0f} د.ل يُرحّل للشهر التالي)"
+                conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount) VALUES(?,'installment_deduction',?,?)",
+                             (line_id, desc_i, inst_paid))
+                salary_installment_apply_fifo(conn, line["employee_id"], mk, inst_paid)
         _write_audit(conn,finalized_by,None,"FINALIZE_PAYROLL","payroll",
-                     f"إقفال مسير {mk}: {len(lines)} موظف | صافي={total_net:,.2f} د.ل")
+                     f"إقفال مسير {mk}: {total_count} موظف | صافي={total_net:,.2f} د.ل" +
+                     (f" (منهم {existing_totals['count']} مصروف فردياً)" if existing_totals["count"] else ""))
         return period_id
+
+
+def payroll_issue_individual(emp_id:int, year:int, month:int, finalized_by:int)->tuple:
+    """Issue salary payslip for ONE employee only. Used by صرف الراتب الشهري page.
+    Reuses / creates a payroll period for the month and inserts a single line.
+    Returns (payslip_number, net_pay).
+    """
+    mk = f"{year:04d}-{month:02d}"
+    with get_db() as conn:
+        # Check if this employee already has a payslip for this month
+        existing_line = conn.execute("""
+            SELECT pl.id, pl.payslip_number, pp.status FROM payroll_lines pl
+            JOIN payroll_periods pp ON pl.period_id = pp.id
+            WHERE pp.month_key=? AND pl.employee_id=?
+        """, (mk, emp_id)).fetchone()
+        if existing_line:
+            raise ValueError(f"الموظف صُرف راتبه لهذا الشهر مسبقاً (كشف رقم: {existing_line['payslip_number']})")
+
+        # Get or create the payroll period
+        period = conn.execute(
+            "SELECT id, status FROM payroll_periods WHERE month_key=?", (mk,)
+        ).fetchone()
+        fin_at = datetime.now().isoformat()
+        if period:
+            if period["status"] == "finalized":
+                raise ValueError(f"مسير {mk} مُقفل — لا يمكن إضافة راتب فردي")
+            period_id = period["id"]
+        else:
+            cur = conn.execute("""
+                INSERT INTO payroll_periods(month_key,year,month,status,
+                    total_gross,total_deductions,total_net,employee_count,created_at)
+                VALUES(?,?,?,'draft',0,0,0,0,?)
+            """, (mk, year, month, fin_at))
+            period_id = cur.lastrowid
+
+        # Compute the line (excess installments auto-roll to next month)
+        line = payroll_compute_line(emp_id, year, month)
+
+        # Generate payslip number based on count of existing lines
+        line_count = conn.execute(
+            "SELECT COUNT(*) as cnt FROM payroll_lines WHERE period_id=?", (period_id,)
+        ).fetchone()["cnt"]
+        ps_num = f"PSL-{year}-{month:02d}-{line_count+1:04d}"
+
+        # Insert payroll_line
+        cur2 = conn.execute("""
+            INSERT INTO payroll_lines(period_id,employee_id,employee_snapshot,
+                base_salary,working_days,absent_days,daily_rate,
+                gross,total_allowances,total_deductions,net_pay,payslip_number)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (period_id, line["employee_id"], line["employee_snapshot"],
+              line["base_salary"], line["working_days"], line["absent_days"],
+              line["daily_rate"], line["gross"], line["allowances_sum"],
+              line["total_deductions"], line["net_pay"], ps_num))
+        line_id = cur2.lastrowid
+
+        # Insert payroll_items
+        for alw in line["allowances"]:
+            conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount,reference_id) VALUES(?,?,?,?,?)",
+                         (line_id, "allowance" if alw["category"]=="allowance" else "deduction",
+                          alw["name_ar"], alw["amount"], alw.get("allowance_type_id")))
+        if line["absence_deduction"] > 0:
+            conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount) VALUES(?,'absence_deduction',?,?)",
+                         (line_id, f"خصم الغياب ({line['absent_days']} يوم)", line["absence_deduction"]))
+        for inst in line["adv_instalments"]:
+            conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount,reference_id) VALUES(?,'advance_deduction','خصم قسط سلفة',?,?)",
+                         (line_id, inst["amount"], inst["advance_id"]))
+            conn.execute("UPDATE advance_instalments SET is_paid=1,paid_at=?,payroll_line_id=? WHERE id=?",
+                         (fin_at, line_id, inst["id"]))
+        conn.execute("""
+            UPDATE advances SET status='settled'
+            WHERE employee_id=? AND status='active'
+            AND id NOT IN (SELECT DISTINCT advance_id FROM advance_instalments WHERE is_paid=0)
+        """, (line["employee_id"],))
+        for pen in line.get("pen_instalments", []):
+            conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount,reference_id) VALUES(?,'penalty_deduction',?,?,?)",
+                         (line_id, f"عقوبة: {pen['reason']}", pen["amount"], pen["id"]))
+            conn.execute("UPDATE penalties SET deducted=1 WHERE id=?", (pen["id"],))
+        inst_paid  = line.get("installment_paid", 0)
+        inst_carry = line.get("installment_carry", 0)
+        if inst_paid > 0:
+            desc_i = "أقساط راتب مُخصمة" if inst_carry == 0 else f"أقساط راتب مُخصمة (متبقي {inst_carry:,.0f} د.ل يُرحّل للشهر التالي)"
+            conn.execute("INSERT INTO payroll_items(line_id,item_type,description_ar,amount) VALUES(?,'installment_deduction',?,?)",
+                         (line_id, desc_i, inst_paid))
+            salary_installment_apply_fifo(conn, line["employee_id"], mk, inst_paid)
+
+        # Update period totals
+        conn.execute("""
+            UPDATE payroll_periods
+            SET total_gross    = COALESCE(total_gross,0) + ?,
+                total_deductions = COALESCE(total_deductions,0) + ?,
+                total_net      = COALESCE(total_net,0) + ?,
+                employee_count = COALESCE(employee_count,0) + 1
+            WHERE id=?
+        """, (line["gross"], line["total_deductions"], line["net_pay"], period_id))
+
+        _write_audit(conn, finalized_by, None, "ISSUE_INDIVIDUAL_SALARY", "payroll",
+                     f"صرف راتب فردي: {line['full_name']} — {mk} — صافي {line['net_pay']:,.2f} د.ل")
+        return ps_num, line["net_pay"]
 
 
 def payroll_get_period(year:int,month:int)->dict|None:
@@ -1333,7 +1631,7 @@ EXPENSE_CATEGORIES = [
 ]
 
 def expense_add(category:str,amount:float,expense_date:str,month_key:str,
-                description:str,logged_by:str)->tuple:
+                description:str,logged_by:str,branch_id:str=None)->tuple:
     if amount <= 0:
         return False,"المبلغ يجب أن يكون أكبر من صفر"
     if not category or not category.strip():
@@ -1341,18 +1639,19 @@ def expense_add(category:str,amount:float,expense_date:str,month_key:str,
     try:
         with get_db() as conn:
             conn.execute("""
-                INSERT INTO company_expenses(category,amount,expense_date,month_key,description,logged_by)
-                VALUES(?,?,?,?,?,?)
+                INSERT INTO company_expenses(category,amount,expense_date,month_key,description,logged_by,branch_id)
+                VALUES(?,?,?,?,?,?,?)
             """,(category.strip(),amount,expense_date,month_key,
-                 (description or "").strip(),logged_by))
+                 (description or "").strip(),logged_by, branch_id))
+            b_label = f" — {BRANCH_NAMES.get(branch_id, branch_id)}" if branch_id else " — عام"
             _write_audit(conn,None,logged_by,"ADD_EXPENSE","expenses",
-                         f"مصروف {category}: {amount} د.ل — {month_key}")
+                         f"مصروف {category}{b_label}: {amount} د.ل — {month_key}")
         return True,"تم تسجيل المصروف بنجاح"
     except Exception as e:
         return False,str(e)
 
 
-def expense_list(month_key:str=None,year:int=None,category:str=None)->list:
+def expense_list(month_key:str=None,year:int=None,category:str=None,branch_id:str=None)->list:
     with get_db() as conn:
         q = "SELECT * FROM company_expenses WHERE 1=1"
         params=[]
@@ -1362,6 +1661,8 @@ def expense_list(month_key:str=None,year:int=None,category:str=None)->list:
             q+=" AND strftime('%Y',expense_date)=?"; params.append(str(year))
         if category:
             q+=" AND category=?"; params.append(category)
+        if branch_id:
+            q+=" AND branch_id=?"; params.append(branch_id)
         q+=" ORDER BY expense_date DESC, id DESC"
         return [dict(r) for r in conn.execute(q,params).fetchall()]
 
@@ -1417,6 +1718,629 @@ def expense_yearly_totals(year:int)->list:
             ORDER BY total DESC
         """,(str(year),)).fetchall()
         return [dict(r) for r in rows]
+
+
+# ══════════════════════════════════════════════════════════════════
+# Salary Installments — partial salary payments during the month
+# Deducted at end-of-month payroll finalization (not a loan)
+# ══════════════════════════════════════════════════════════════════
+
+def salary_installment_add(emp_id:int, amount:float, pay_date:str,
+                            description:str, approved_by:str, logged_by:str,
+                            force:bool=False)->tuple:
+    """Add a salary installment. Allows exceeding monthly salary — excess is
+    automatically carried to next month's payroll (not a loan). Returns
+    (ok, message) — message includes carry-over warning when applicable."""
+    if amount <= 0:
+        return False, "المبلغ يجب أن يكون أكبر من صفر"
+    mk = pay_date[:7]
+    try:
+        with get_db() as conn:
+            emp = conn.execute("SELECT full_name FROM employees WHERE id=?",(emp_id,)).fetchone()
+            if not emp:
+                return False, "الموظف غير موجود"
+            # Check if salary already issued for this month
+            paid_line = conn.execute("""
+                SELECT pl.payslip_number FROM payroll_lines pl
+                JOIN payroll_periods pp ON pl.period_id = pp.id
+                WHERE pp.month_key=? AND pl.employee_id=?
+            """, (mk, emp_id)).fetchone()
+            if paid_line:
+                return False, f"لا يمكن إضافة قسط — راتب الموظف صُرف لهذا الشهر (كشف: {paid_line['payslip_number']})"
+
+            sal_row = conn.execute("""
+                SELECT base_salary FROM salary_structures WHERE employee_id=?
+                ORDER BY effective_date DESC LIMIT 1
+            """,(emp_id,)).fetchone()
+            base = sal_row["base_salary"] if sal_row else 0
+            # Sum of ALL pending (any past month, unsettled)
+            prev = conn.execute("""
+                SELECT COALESCE(SUM(amount),0) as total FROM salary_installments
+                WHERE employee_id=? AND month_key<=? AND settled=0
+            """,(emp_id, mk)).fetchone()["total"]
+            new_total = prev + amount
+
+            conn.execute("""
+                INSERT INTO salary_installments(employee_id,amount,pay_date,month_key,
+                    description,approved_by,logged_by)
+                VALUES(?,?,?,?,?,?,?)
+            """,(emp_id, amount, pay_date, mk, (description or "").strip(),
+                 (approved_by or "").strip(), logged_by))
+            _write_audit(conn, None, logged_by, "ADD_SALARY_INSTALLMENT", "salary_installments",
+                         f"قسط راتب {emp['full_name']}: {amount} د.ل — {mk}")
+
+            msg = "تم تسجيل القسط بنجاح"
+            if base > 0 and new_total > base:
+                carry = new_total - base
+                msg = (f"⚠️ تم التسجيل — إجمالي الأقساط ({new_total:,.0f} د.ل) تجاوز الراتب ({base:,.0f} د.ل). "
+                       f"سيُخصم {base:,.0f} د.ل هذا الشهر، والمتبقي {carry:,.0f} د.ل يُرحّل للشهر التالي (ليس سلفة).")
+        return True, msg
+    except Exception as e:
+        return False, str(e)
+
+
+def salary_installment_list(emp_id:int=None, month_key:str=None, year:int=None,
+                             include_settled:bool=False)->list:
+    with get_db() as conn:
+        q = """SELECT si.*, e.full_name, e.employee_number
+               FROM salary_installments si
+               JOIN employees e ON si.employee_id = e.id
+               WHERE 1=1"""
+        params = []
+        if emp_id:
+            q += " AND si.employee_id=?"; params.append(emp_id)
+        if month_key:
+            q += " AND si.month_key=?"; params.append(month_key)
+        if year:
+            q += " AND strftime('%Y', si.pay_date)=?"; params.append(str(year))
+        if not include_settled:
+            q += " AND si.settled=0"
+        q += " ORDER BY si.pay_date DESC, si.id DESC"
+        return [dict(r) for r in conn.execute(q, params).fetchall()]
+
+
+def salary_installment_delete(inst_id:int)->tuple:
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT settled FROM salary_installments WHERE id=?",(inst_id,)).fetchone()
+            if not row:
+                return False, "السجل غير موجود"
+            if row["settled"] == 1:
+                return False, "لا يمكن حذف دفعة تمت تسويتها في مسير الرواتب"
+            conn.execute("DELETE FROM salary_installments WHERE id=?", (inst_id,))
+        return True, "تم حذف الدفعة"
+    except Exception as e:
+        return False, str(e)
+
+
+def salary_installment_month_total(emp_id:int, year:int, month:int)->float:
+    """Sum of unsettled installments for THIS specific month only (for UI display)."""
+    mk = f"{year:04d}-{month:02d}"
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(amount),0) as total FROM salary_installments
+            WHERE employee_id=? AND month_key=? AND settled=0
+        """,(emp_id, mk)).fetchone()
+        return row["total"] if row else 0.0
+
+
+def salary_installment_pending_total(emp_id:int, year:int, month:int)->float:
+    """Sum of ALL unsettled installments through this month — includes rollover from
+    previous months. Used by payroll to compute deductions."""
+    mk = f"{year:04d}-{month:02d}"
+    with get_db() as conn:
+        row = conn.execute("""
+            SELECT COALESCE(SUM(amount),0) as total FROM salary_installments
+            WHERE employee_id=? AND month_key<=? AND settled=0
+        """,(emp_id, mk)).fetchone()
+        return row["total"] if row else 0.0
+
+
+def salary_installment_apply_fifo(conn, emp_id:int, month_key:str, amount_to_apply:float)->None:
+    """Settle pending installments in FIFO order up to amount_to_apply.
+    Splits the last one if it doesn't fit exactly. Anything not settled rolls
+    forward automatically (it stays with month_key<=next_month)."""
+    if amount_to_apply <= 0:
+        return
+    remaining = round(amount_to_apply, 2)
+    pending = conn.execute("""
+        SELECT id, amount, pay_date, month_key, description, approved_by, logged_by
+        FROM salary_installments
+        WHERE employee_id=? AND settled=0 AND month_key<=?
+        ORDER BY month_key ASC, pay_date ASC, id ASC
+    """, (emp_id, month_key)).fetchall()
+    for p in pending:
+        if remaining <= 0.005:
+            break
+        amt = p["amount"]
+        if amt <= remaining + 0.005:
+            # Fully settle
+            conn.execute("UPDATE salary_installments SET settled=1 WHERE id=?", (p["id"],))
+            remaining = round(remaining - amt, 2)
+        else:
+            # Partial: split
+            settled_part = round(remaining, 2)
+            leftover     = round(amt - remaining, 2)
+            # Reduce the pending record to the leftover
+            conn.execute("UPDATE salary_installments SET amount=? WHERE id=?", (leftover, p["id"]))
+            # Insert a new settled record for the applied portion
+            conn.execute("""
+                INSERT INTO salary_installments(employee_id,amount,pay_date,month_key,
+                    description,approved_by,logged_by,settled)
+                VALUES(?,?,?,?,?,?,?,1)
+            """, (emp_id, settled_part, p["pay_date"], p["month_key"],
+                  (p["description"] or "") + " (جزء مُخصم)",
+                  p["approved_by"], p["logged_by"]))
+            remaining = 0
+
+
+def salary_installment_summary(year:int, month:int)->list:
+    """Per-employee summary of partial payments for a specific month with remaining balance."""
+    mk = f"{year:04d}-{month:02d}"
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT e.id, e.employee_number, e.full_name,
+                   COALESCE(ss.base_salary, 0) as base_salary,
+                   COALESCE(SUM(si.amount), 0) as paid,
+                   COUNT(si.id) as tx_count
+            FROM employees e
+            LEFT JOIN salary_structures ss ON ss.employee_id = e.id
+                 AND ss.effective_date = (SELECT MAX(effective_date) FROM salary_structures WHERE employee_id=e.id)
+            LEFT JOIN salary_installments si ON si.employee_id = e.id
+                 AND si.month_key = ? AND si.settled = 0
+            WHERE e.status = 'active'
+            GROUP BY e.id
+            HAVING paid > 0 OR base_salary > 0
+            ORDER BY paid DESC, e.full_name
+        """,(mk,)).fetchall()
+        result = []
+        for r in rows:
+            d = dict(r)
+            d["remaining"] = max(0, d["base_salary"] - d["paid"])
+            result.append(d)
+        return result
+
+
+# ══════════════════════════════════════════════════════════════════
+# Branch Custody (عهدة الفروع) — petty cash per branch per month
+# Rolls over to next month if not fully spent.
+# ══════════════════════════════════════════════════════════════════
+
+BRANCH_CUSTODY_CATEGORIES = [
+    "مصروفات نظافة","قرطاسية / مكتبية","وقود / مواصلات","صيانة",
+    "ضيافة","إتصالات","طوارئ","أخرى"
+]
+
+def _branch_custody_prev_remaining(conn, branch_id:str, month_key:str)->float:
+    """Compute remaining balance from PREVIOUS month for a branch."""
+    yr, mo = int(month_key[:4]), int(month_key[5:7])
+    prev_mo = 12 if mo == 1 else mo - 1
+    prev_yr = yr - 1 if mo == 1 else yr
+    prev_mk = f"{prev_yr:04d}-{prev_mo:02d}"
+    row = conn.execute("SELECT id, allocated_amount, carry_from_previous FROM branch_custody WHERE branch_id=? AND month_key=?",
+                       (branch_id, prev_mk)).fetchone()
+    if not row:
+        return 0.0
+    total_in = (row["allocated_amount"] or 0) + (row["carry_from_previous"] or 0)
+    spent = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM branch_custody_expenses WHERE custody_id=?",
+                         (row["id"],)).fetchone()["t"]
+    return max(0.0, total_in - spent)
+
+
+def branch_custody_assign(branch_id:str, month_key:str, amount:float,
+                          notes:str, assigned_by:str)->tuple:
+    """Assign عهدة to a branch for a month. Auto-adds carry from previous month.
+    If a record already exists, update the allocated amount (append)."""
+    if amount < 0:
+        return False, "المبلغ يجب أن يكون موجباً"
+    try:
+        with get_db() as conn:
+            carry = _branch_custody_prev_remaining(conn, branch_id, month_key)
+            existing = conn.execute("SELECT id, allocated_amount FROM branch_custody WHERE branch_id=? AND month_key=?",
+                                     (branch_id, month_key)).fetchone()
+            if existing:
+                new_amt = (existing["allocated_amount"] or 0) + amount
+                conn.execute("UPDATE branch_custody SET allocated_amount=?, notes=?, assigned_by=? WHERE id=?",
+                             (new_amt, (notes or "").strip(), assigned_by, existing["id"]))
+                _write_audit(conn, None, assigned_by, "UPDATE_BRANCH_CUSTODY", "branch_custody",
+                             f"إضافة {amount} د.ل لعهدة {BRANCH_NAMES.get(branch_id,branch_id)} — {month_key}")
+                return True, f"تم إضافة {amount:,.0f} د.ل — الإجمالي الآن {new_amt:,.0f} د.ل"
+            else:
+                conn.execute("""
+                    INSERT INTO branch_custody(branch_id,month_key,allocated_amount,carry_from_previous,notes,assigned_by)
+                    VALUES(?,?,?,?,?,?)
+                """, (branch_id, month_key, amount, carry, (notes or "").strip(), assigned_by))
+                _write_audit(conn, None, assigned_by, "ASSIGN_BRANCH_CUSTODY", "branch_custody",
+                             f"عهدة جديدة {BRANCH_NAMES.get(branch_id,branch_id)} — {month_key}: {amount} د.ل (مرحّل {carry:,.0f})")
+                msg = f"تم تخصيص {amount:,.0f} د.ل"
+                if carry > 0:
+                    msg += f" + {carry:,.0f} د.ل مُرحّلة من الشهر السابق = {amount+carry:,.0f} د.ل"
+                return True, msg
+    except Exception as e:
+        return False, str(e)
+
+
+def branch_custody_get(branch_id:str, month_key:str)->dict|None:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM branch_custody WHERE branch_id=? AND month_key=?",
+                           (branch_id, month_key)).fetchone()
+        if not row:
+            return None
+        d = dict(row)
+        spent = conn.execute("SELECT COALESCE(SUM(amount),0) as t, COUNT(*) as c FROM branch_custody_expenses WHERE custody_id=?",
+                             (row["id"],)).fetchone()
+        d["spent"] = spent["t"]
+        d["expense_count"] = spent["c"]
+        d["total_available"] = (d["allocated_amount"] or 0) + (d["carry_from_previous"] or 0)
+        d["remaining"] = d["total_available"] - d["spent"]
+        return d
+
+
+def branch_custody_expense_add(branch_id:str, month_key:str, amount:float,
+                                description:str, category:str, expense_date:str,
+                                logged_by:str)->tuple:
+    if amount <= 0:
+        return False, "المبلغ يجب أن يكون أكبر من صفر"
+    if not description or not description.strip():
+        return False, "السبب مطلوب"
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT id, status FROM branch_custody WHERE branch_id=? AND month_key=?",
+                                (branch_id, month_key)).fetchone()
+            if not row:
+                return False, f"لا توجد عهدة مخصصة لهذا الفرع في {month_key}. أضف تخصيص أولاً."
+            if row["status"] == "closed":
+                return False, f"العهدة مُقفلة لهذا الشهر — لا يمكن إضافة مصروفات جديدة."
+            custody_id = row["id"]
+            conn.execute("""
+                INSERT INTO branch_custody_expenses(custody_id,amount,description,expense_date,category,logged_by)
+                VALUES(?,?,?,?,?,?)
+            """, (custody_id, amount, description.strip(), expense_date, "", logged_by))
+            _write_audit(conn, None, logged_by, "ADD_BRANCH_CUSTODY_EXPENSE", "branch_custody_expenses",
+                         f"صرف {amount} د.ل من عهدة {BRANCH_NAMES.get(branch_id,branch_id)} — {description}")
+        return True, "تم تسجيل المصروف"
+    except Exception as e:
+        return False, str(e)
+
+
+def branch_custody_close_month(branch_id:str, month_key:str, closed_by:str)->tuple:
+    """Close the custody for this month + create next-month record with the
+    remaining carried forward automatically."""
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT * FROM branch_custody WHERE branch_id=? AND month_key=?",
+                                (branch_id, month_key)).fetchone()
+            if not row:
+                return False, "لا توجد عهدة لهذا الشهر"
+            if row["status"] == "closed":
+                return False, "العهدة مُقفلة مسبقاً"
+            # Compute remaining
+            spent = conn.execute("SELECT COALESCE(SUM(amount),0) as t FROM branch_custody_expenses WHERE custody_id=?",
+                                  (row["id"],)).fetchone()["t"]
+            total_in = (row["allocated_amount"] or 0) + (row["carry_from_previous"] or 0)
+            remaining = round(total_in - spent, 2)
+            now_iso = datetime.now().isoformat()
+            # Close current month
+            conn.execute("UPDATE branch_custody SET status='closed', closed_at=?, closed_by=? WHERE id=?",
+                         (now_iso, closed_by, row["id"]))
+            # Auto-create next month with the remaining as carry (if not exists)
+            yr, mo = int(month_key[:4]), int(month_key[5:7])
+            nxt_mo = 1 if mo == 12 else mo + 1
+            nxt_yr = yr + 1 if mo == 12 else yr
+            nxt_mk = f"{nxt_yr:04d}-{nxt_mo:02d}"
+            existing_next = conn.execute("SELECT id FROM branch_custody WHERE branch_id=? AND month_key=?",
+                                          (branch_id, nxt_mk)).fetchone()
+            if existing_next:
+                # Update carry to reflect the fresh close
+                conn.execute("UPDATE branch_custody SET carry_from_previous=? WHERE id=?",
+                             (remaining, existing_next["id"]))
+            else:
+                conn.execute("""
+                    INSERT INTO branch_custody(branch_id,month_key,allocated_amount,carry_from_previous,
+                        notes,assigned_by,status)
+                    VALUES(?,?,?,?,?,?,'open')
+                """, (branch_id, nxt_mk, 0, remaining, "مُرحّل تلقائياً من إقفال الشهر السابق", closed_by))
+            _write_audit(conn, None, closed_by, "CLOSE_BRANCH_CUSTODY", "branch_custody",
+                         f"إقفال عهدة {BRANCH_NAMES.get(branch_id,branch_id)} — {month_key} | مُرحّل {remaining} د.ل")
+        return True, f"تم إقفال الشهر. تم ترحيل {remaining:,.0f} د.ل للشهر التالي ({nxt_mk})."
+    except Exception as e:
+        return False, str(e)
+
+
+def branch_custody_reopen_month(branch_id:str, month_key:str, reopened_by:str)->tuple:
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE branch_custody SET status='open', closed_at=NULL, closed_by=NULL WHERE branch_id=? AND month_key=?",
+                         (branch_id, month_key))
+            _write_audit(conn, None, reopened_by, "REOPEN_BRANCH_CUSTODY", "branch_custody",
+                         f"إعادة فتح عهدة {BRANCH_NAMES.get(branch_id,branch_id)} — {month_key}")
+        return True, "تم إعادة فتح العهدة"
+    except Exception as e:
+        return False, str(e)
+
+
+def branch_custody_reason_list()->list:
+    """Return distinct previously-used expense descriptions, sorted by frequency."""
+    with get_db() as conn:
+        rows = conn.execute("""
+            SELECT description, COUNT(*) as usage_count
+            FROM branch_custody_expenses
+            WHERE description IS NOT NULL AND description != ''
+            GROUP BY description
+            ORDER BY usage_count DESC, description ASC
+        """).fetchall()
+        return [r["description"] for r in rows]
+
+
+def branch_custody_expense_list(branch_id:str, month_key:str)->list:
+    with get_db() as conn:
+        row = conn.execute("SELECT id FROM branch_custody WHERE branch_id=? AND month_key=?",
+                            (branch_id, month_key)).fetchone()
+        if not row:
+            return []
+        return [dict(r) for r in conn.execute("""
+            SELECT * FROM branch_custody_expenses WHERE custody_id=?
+            ORDER BY expense_date DESC, id DESC
+        """, (row["id"],)).fetchall()]
+
+
+def branch_custody_expense_delete(expense_id:int)->tuple:
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT id FROM branch_custody_expenses WHERE id=?", (expense_id,)).fetchone()
+            if not row:
+                return False, "المصروف غير موجود"
+            conn.execute("DELETE FROM branch_custody_expenses WHERE id=?", (expense_id,))
+        return True, "تم الحذف"
+    except Exception as e:
+        return False, str(e)
+
+
+def branch_custody_summary(month_key:str)->list:
+    """Summary of all branches for a given month."""
+    with get_db() as conn:
+        results = []
+        for bid, bname in BRANCH_NAMES.items():
+            row = conn.execute("SELECT * FROM branch_custody WHERE branch_id=? AND month_key=?",
+                                (bid, month_key)).fetchone()
+            if row:
+                spent = conn.execute("SELECT COALESCE(SUM(amount),0) as t, COUNT(*) as c FROM branch_custody_expenses WHERE custody_id=?",
+                                      (row["id"],)).fetchone()
+                allocated = row["allocated_amount"] or 0
+                carry = row["carry_from_previous"] or 0
+                total = allocated + carry
+                results.append({
+                    "branch_id": bid,
+                    "branch_name": bname,
+                    "allocated": allocated,
+                    "carry_from_previous": carry,
+                    "total_available": total,
+                    "spent": spent["t"],
+                    "expense_count": spent["c"],
+                    "remaining": total - spent["t"],
+                })
+        return results
+
+
+# ══════════════════════════════════════════════════════════════════
+# Accounts Ledger (الحسابات) — generic party ledger
+# Each account has charges (مستحقات = ما علينا) and payments (مدفوعات).
+# Balance = total charges − total payments.
+#   موجب  → دين علينا (نحن مدينون له)
+#   سالب  → رصيد فائض (دفعنا زيادة / له عندنا)
+# ══════════════════════════════════════════════════════════════════
+
+PAYMENT_TYPES_AR = {"cash": "نقدي", "transfer": "تحويل بنكي"}
+
+# ── Accounts ──────────────────────────────────────────────────────
+def account_add(name:str, phone:str, notes:str)->tuple:
+    if not name or not name.strip():
+        return False, "اسم الحساب مطلوب"
+    try:
+        with get_db() as conn:
+            conn.execute("INSERT INTO accounts(name,phone,notes) VALUES(?,?,?)",
+                         (name.strip(), (phone or "").strip(), (notes or "").strip()))
+        return True, "تم إضافة الحساب بنجاح"
+    except Exception as e:
+        return False, str(e)
+
+
+def account_list(active_only:bool=True)->list:
+    with get_db() as conn:
+        q = "SELECT * FROM accounts"
+        if active_only:
+            q += " WHERE is_active=1"
+        q += " ORDER BY name"
+        return [dict(r) for r in conn.execute(q).fetchall()]
+
+
+def account_edit(account_id:int, name:str, phone:str, notes:str)->tuple:
+    if not name or not name.strip():
+        return False, "اسم الحساب مطلوب"
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE accounts SET name=?, phone=?, notes=? WHERE id=?",
+                         (name.strip(), (phone or "").strip(), (notes or "").strip(), account_id))
+        return True, "تم تحديث بيانات الحساب"
+    except Exception as e:
+        return False, str(e)
+
+
+def account_deactivate(account_id:int)->tuple:
+    """Soft-delete: hide the account but keep its charges/payments history."""
+    try:
+        with get_db() as conn:
+            conn.execute("UPDATE accounts SET is_active=0 WHERE id=?", (account_id,))
+        return True, "تم إخفاء الحساب (سجلاته محفوظة)"
+    except Exception as e:
+        return False, str(e)
+
+
+def account_balance(account_id:int)->dict:
+    """Total charges − total payments. Positive = we owe them; negative = surplus."""
+    with get_db() as conn:
+        total_charges = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) as t FROM account_charges WHERE account_id=?",
+            (account_id,)).fetchone()["t"]
+        total_paid = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) as t FROM account_payments WHERE account_id=?",
+            (account_id,)).fetchone()["t"]
+        return {
+            "total_charges": total_charges,
+            "total_paid": total_paid,
+            "balance": round(total_charges - total_paid, 2),
+        }
+
+
+# ── Charges (مستحقات / احتياجات) ──────────────────────────────────
+def charge_add(account_id:int, amount:float, charge_date:str, reference:str,
+               description:str, logged_by:str)->tuple:
+    if amount < 0:
+        return False, "المبلغ لا يمكن أن يكون سالباً"
+    if not description or not description.strip():
+        return False, "الوصف مطلوب"
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO account_charges(account_id,amount,charge_date,reference,description,logged_by)
+                VALUES(?,?,?,?,?,?)
+            """, (account_id, amount, charge_date, (reference or "").strip(),
+                  description.strip(), logged_by))
+            _write_audit(conn, None, logged_by, "ADD_CHARGE", "account_charges",
+                         f"مستحق {amount} د.ل — {description.strip()[:40]}")
+        return True, "تم تسجيل المستحق بنجاح"
+    except Exception as e:
+        return False, str(e)
+
+
+def charge_list(account_id:int)->list:
+    with get_db() as conn:
+        return [dict(r) for r in conn.execute("""
+            SELECT * FROM account_charges WHERE account_id=?
+            ORDER BY charge_date DESC, id DESC
+        """, (account_id,)).fetchall()]
+
+
+def charge_delete(charge_id:int)->tuple:
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT id FROM account_charges WHERE id=?", (charge_id,)).fetchone()
+            if not row:
+                return False, "المستحق غير موجود"
+            conn.execute("DELETE FROM account_charges WHERE id=?", (charge_id,))
+        return True, "تم حذف المستحق"
+    except Exception as e:
+        return False, str(e)
+
+
+def charges_with_status(account_id:int)->list:
+    """All charges with a computed payment status ('paid'/'partial'/'unpaid')
+    using FIFO allocation of payments across charges (oldest first)."""
+    with get_db() as conn:
+        charges = [dict(r) for r in conn.execute("""
+            SELECT * FROM account_charges WHERE account_id=?
+            ORDER BY charge_date ASC, id ASC
+        """, (account_id,)).fetchall()]
+        total_paid = conn.execute(
+            "SELECT COALESCE(SUM(amount),0) as t FROM account_payments WHERE account_id=?",
+            (account_id,)).fetchone()["t"]
+
+    remaining_credit = total_paid
+    for c in charges:
+        amt = c["amount"]
+        if remaining_credit <= 0.005:
+            c["status"] = "unpaid";  c["paid_amount"] = 0.0
+        elif remaining_credit >= amt:
+            c["status"] = "paid";    c["paid_amount"] = amt
+            remaining_credit = round(remaining_credit - amt, 2)
+        else:
+            c["status"] = "partial"; c["paid_amount"] = round(remaining_credit, 2)
+            remaining_credit = 0.0
+        c["remaining_amount"] = round(amt - c["paid_amount"], 2)
+
+    charges.sort(key=lambda x: (x["charge_date"], x["id"]), reverse=True)
+    return charges
+
+
+# ── Payments (مدفوعات) ────────────────────────────────────────────
+def payment_add(account_id:int, amount:float, payment_date:str, payment_type:str,
+                description:str, notes:str, logged_by:str,
+                charge_id:int=None, handled_by:str=None)->tuple:
+    if amount <= 0:
+        return False, "المبلغ يجب أن يكون أكبر من صفر"
+    if payment_type not in PAYMENT_TYPES_AR:
+        return False, "نوع الدفع غير صالح"
+    try:
+        with get_db() as conn:
+            conn.execute("""
+                INSERT INTO account_payments(account_id,charge_id,amount,payment_date,payment_type,
+                    handled_by,description,notes,logged_by)
+                VALUES(?,?,?,?,?,?,?,?,?)
+            """, (account_id, charge_id, amount, payment_date, payment_type,
+                  (handled_by or "").strip(), (description or "").strip(),
+                  (notes or "").strip(), logged_by))
+            _write_audit(conn, None, logged_by, "ADD_PAYMENT", "account_payments",
+                         f"دفعة {amount} د.ل — {PAYMENT_TYPES_AR[payment_type]}")
+        return True, "تم تسجيل الدفعة بنجاح"
+    except Exception as e:
+        return False, str(e)
+
+
+def payment_list(account_id:int)->list:
+    with get_db() as conn:
+        return [dict(r) for r in conn.execute("""
+            SELECT p.*, c.reference as charge_ref, c.description as charge_desc
+            FROM account_payments p
+            LEFT JOIN account_charges c ON p.charge_id = c.id
+            WHERE p.account_id=?
+            ORDER BY p.payment_date DESC, p.id DESC
+        """, (account_id,)).fetchall()]
+
+
+def payment_delete(payment_id:int)->tuple:
+    try:
+        with get_db() as conn:
+            row = conn.execute("SELECT id FROM account_payments WHERE id=?", (payment_id,)).fetchone()
+            if not row:
+                return False, "الدفعة غير موجودة"
+            conn.execute("DELETE FROM account_payments WHERE id=?", (payment_id,))
+        return True, "تم حذف الدفعة"
+    except Exception as e:
+        return False, str(e)
+
+
+def account_ledger(account_id:int, date_from:str=None, date_to:str=None)->list:
+    """Unified ledger: charges (debit) + payments (credit), sorted by date,
+    with running balance computed chronologically.
+    Running balance is always cumulative from the start; date_from/date_to only
+    filter which rows are *returned* (opening balance is preserved via the row
+    just before the window — callers can read running_balance of the first row)."""
+    with get_db() as conn:
+        charges = conn.execute("""
+            SELECT id, charge_date as tx_date, amount as debit, 0 as credit,
+                   'charge' as tx_type, reference as ref, description
+            FROM account_charges WHERE account_id=?
+        """, (account_id,)).fetchall()
+        pays = conn.execute("""
+            SELECT p.id, p.payment_date as tx_date, 0 as debit, p.amount as credit,
+                   'payment' as tx_type, p.payment_type as ref, p.description,
+                   p.handled_by, c.reference as paid_for_ref
+            FROM account_payments p
+            LEFT JOIN account_charges c ON p.charge_id = c.id
+            WHERE p.account_id=?
+        """, (account_id,)).fetchall()
+        combined = [dict(r) for r in charges] + [dict(r) for r in pays]
+        combined.sort(key=lambda x: (x["tx_date"], x["id"]))
+        running = 0.0
+        for row in combined:
+            running += row["debit"] - row["credit"]
+            row["running_balance"] = round(running, 2)
+        # Date-window filter (applied AFTER running balance is computed)
+        if date_from:
+            combined = [r for r in combined if r["tx_date"] >= date_from]
+        if date_to:
+            combined = [r for r in combined if r["tx_date"] <= date_to]
+        return combined
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -1886,6 +2810,7 @@ def delete_employee(emp_id: int, deleted_by_username: str = "admin") -> tuple:
             conn.execute("DELETE FROM cash_payments WHERE employee_id=?", (emp_id,))
             conn.execute("DELETE FROM penalties WHERE employee_id=?", (emp_id,))
             conn.execute("DELETE FROM salary_holds WHERE employee_id=?", (emp_id,))
+            conn.execute("DELETE FROM salary_installments WHERE employee_id=?", (emp_id,))
             conn.execute("DELETE FROM employees WHERE id=?", (emp_id,))
             conn.execute("PRAGMA foreign_keys=ON")
 
